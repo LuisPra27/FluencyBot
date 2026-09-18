@@ -532,7 +532,7 @@ def dismiss_speech_modal(page):
     page.wait_for_timeout(1500)
 
 
-def get_current_exercise(page):
+def get_current_exercise(page, capture_audio=True):
     """
     Detecta el ejercicio mostrado actualmente y devuelve un dict consumible
     por ai.solve_exercise(). El shape varía según "type":
@@ -549,6 +549,18 @@ def get_current_exercise(page):
                             (espacios en blanco de texto libre, sin opciones para elegir)
 
     Confirmado inspeccionando el HTML real de Fluency Builder.
+
+    capture_audio=False salta la captura de audio de los ejercicios que
+    son solo-audio. Esa captura intercepta peticiones reales de red y es
+    de lejos lo más lento de esta función, así que no vale la pena cuando
+    quien llama solo necesita saber QUÉ pantalla es y ya sabe que la va a
+    omitir (ver run_lesson: al "Reanudar", Rosetta siempre reinicia desde
+    el paso 1, y las actividades ya contadas se pasan de largo sin llamar
+    a la IA — bajar su audio para tirarlo era tiempo puro perdido, que es
+    justo lo que el usuario notó en vivo: "escucha todas las opciones
+    consumiendo tiempo y aun así las omite"). El dict devuelto queda
+    marcado "unsolvable" porque sin ese audio de verdad no se puede
+    resolver: NO uses el resultado para intentar responder.
     """
     if (
         page.locator('[data-qa="MultipleChoicePromptText"]').count() > 0
@@ -575,7 +587,7 @@ def get_current_exercise(page):
             prompt_audio_url = None
         else:
             prompt = ""
-            prompt_audio_url = get_prompt_audio_data_uri(page)
+            prompt_audio_url = get_prompt_audio_data_uri(page) if capture_audio else None
             if prompt_audio_url is None:
                 unsolvable = True
 
@@ -589,7 +601,11 @@ def get_current_exercise(page):
         # no "hay ListenButton". Cuando falta, se extrae el audio real (en
         # vez de rendirse) para que la IA lo escuche.
         if choices.count() > 0 and choices.nth(0).locator('[data-qa="ChoiceText"]').count() == 0:
-            option_audio_urls = get_choice_audio_data_uris(page, choices.count())
+            option_audio_urls = (
+                get_choice_audio_data_uris(page, choices.count())
+                if capture_audio
+                else [None] * choices.count()
+            )
             if any(url is None for url in option_audio_urls):
                 unsolvable = True
             return {
@@ -645,7 +661,7 @@ def get_current_exercise(page):
         # de Rosetta no da crédito real, así que adivinar no es aceptable
         # aquí si en realidad se puede "escuchar".
         target_audio_urls = None
-        if not targets_are_images and not any(target_values):
+        if capture_audio and not targets_are_images and not any(target_values):
             target_audio_urls = get_matching_target_audio_data_uris(page, target_count)
 
         # "unsolvable" solo si de verdad no hay ninguna señal usable (ni

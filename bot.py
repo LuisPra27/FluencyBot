@@ -160,7 +160,9 @@ def _wait_for_advance(page, timeout_ms=8000, poll_ms=500):
         if page.locator('[data-qa="SubmitButton"], [data-qa="StartLessonButton"]').count() > 0:
             return True
         try:
-            browser.get_current_exercise(page)
+            # Solo interesa SI hay un ejercicio, no cuál: sin capture_audio
+            # esto se repetiría bajando el audio entero en cada sondeo.
+            browser.get_current_exercise(page, capture_audio=False)
             return True
         except NotImplementedError:
             pass
@@ -476,8 +478,14 @@ def run_lesson(page, lesson_title, already_completed=0, max_skips=MAX_SKIPS):
             browser.dismiss_speech_modal(page)
             continue
 
+        # Mientras seguimos pasando de largo por lo ya contado (ver la rama
+        # `solved < already_completed` más abajo) solo hace falta saber QUÉ
+        # pantalla es, no resolverla: capturar el audio de un ejercicio
+        # solo-audio intercepta peticiones reales de red y es lo más lento
+        # de get_current_exercise(). Bajarlo para tirarlo era tiempo puro
+        # perdido en cada "Reanudar", que siempre reinicia desde el paso 1.
         try:
-            exercise = browser.get_current_exercise(page)
+            exercise = browser.get_current_exercise(page, capture_audio=solved >= already_completed)
         except NotImplementedError:
             # Si ya se descartó el modal de habla antes en esta misma sesión
             # de navegador (ej. en una lección anterior), no vuelve a
