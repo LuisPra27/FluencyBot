@@ -906,8 +906,16 @@ def run_lesson(page, lesson_title, already_completed=0, max_skips=MAX_SKIPS):
     # antes y después, NO por lo que devuelve work_pending_activities: ese
     # solo cuenta ejercicios resueltos, así que una ronda que arregló
     # únicamente un video o un Vocabulario devolvía 0 y cortaba de más.
+    #
+    # Pero el número de pendientes tampoco basta por sí solo: una ronda en
+    # la que la IA falla y Rosetta enseña la respuesta NO baja el contador
+    # (el ejercicio sigue mal) y sin embargo es la ronda más valiosa de
+    # todas, porque deja la respuesta guardada. Cortar ahí dejaba el
+    # aprendizaje sin usar hasta la siguiente corrida. Por eso también se
+    # mira si se aprendió algo nuevo.
     pending = []
     previous_pending = None
+    learned = set()
     for retry_round in range(1, MAX_RETRY_ROUNDS + 1):
         if not browser.go_to_lesson_summary(page):
             print(f"No se pudo abrir el resumen de '{lesson_title}'; no se puede verificar qué quedó pendiente.")
@@ -917,13 +925,17 @@ def run_lesson(page, lesson_title, already_completed=0, max_skips=MAX_SKIPS):
         workable = [a for a in pending if a["type"] not in browser.SPEECH_ACTIVITY_TYPES]
         if not workable:
             break
-        if previous_pending is not None and len(workable) >= previous_pending:
+        if previous_pending is not None and len(workable) >= previous_pending and not learned:
             print(f"'{lesson_title}': la última ronda no cambió nada ({len(workable)} pendiente(s)); no insisto más.")
             break
 
         previous_pending = len(workable)
         print(f"'{lesson_title}': pasada {retry_round}/{MAX_RETRY_ROUNDS} sobre {len(workable)} pendiente(s)...")
+        answers_before = set(_load_known_answers())
         work_pending_activities(page, lesson_title)
+        learned = set(_load_known_answers()) - answers_before
+        if learned:
+            print(f"'{lesson_title}': se aprendieron {len(learned)} respuesta(s) nueva(s); otra pasada para usarlas.")
 
     # Veredicto real de la lección, leído del panel lateral y no del
     # contador: el contador sube igual esté bien o mal, así que no sirve
