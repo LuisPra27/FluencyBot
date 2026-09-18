@@ -234,61 +234,164 @@ def has_speech_modal(page):
     return page.get_by_text("Continuar sin voz", exact=True).count() > 0
 
 
-def get_flagged_activity_ids(page):
+# Nombres de tipo de actividad (tal como aparecen en el ActivityMapTitle del
+# panel lateral) que requieren grabar la propia voz: lo ÚNICO que se acepta
+# dejar sin resolver. Cualquier tipo que NO esté aquí se considera
+# resoluble — el default tiene que ser "reintentable", porque dar por
+# bloqueada una lección de más es justo el error que llenó
+# blocked_lessons.json de falsos positivos.
+SPEECH_ACTIVITY_TYPES = {
+    "Lectura en voz alta",
+    "Pronunciación",
+    "Hablar",
+    "Habla",
+}
+
+# Textos de estado que significan "esta actividad ya quedó bien de verdad".
+# "Completa" es de contenido no evaluado (Demostración, Vocabulario,
+# Explicación); "Correcta" es de un ejercicio evaluado respondido bien.
+DONE_ACTIVITY_STATUSES = {"Completa", "Correcta"}
+
+# Items del panel lateral que no son actividades reales de la lección.
+_NON_ACTIVITY_IDS = {"objectives", "summary"}
+
+
+def get_activity_statuses(page):
     """
-    Devuelve los IDs (estables, únicos por actividad) de las actividades
-    del panel lateral marcadas "Omitida" o "Vuelva a intentarlo".
+    Lee el panel lateral (`data-qa="ActivityMapList"`) y devuelve una lista
+    de dicts, uno por actividad real de la lección, en orden:
 
-    Cada actividad tiene un contenedor `data-qa="activity_<id>"` con un
-    hijo cuyo `data-qa` indica el estado — **ojo, el sufijo varía según el
-    estado** (confirmado en vivo con capturas): `activity_<id>_completed`
-    para "Correcta"/"Completa", pero `activity_<id>_skipped` para
-    "Omitida" (posiblemente otros sufijos para otros estados). Por eso NO
-    hay que buscar por un sufijo fijo — se busca directamente el
-    contenedor (`data-qa="activity_<id>"`, sin más sufijo) y se revisa su
-    texto completo, sin importar qué sufijo tenga el hijo de estado.
+        {"id", "type", "status", "status_qa"}
 
-    Mientras estás PARADO en una actividad no existe ningún hijo de estado
-    para ella (ni vacío) — por eso no hay forma de saber si un ejercicio
-    ya visto era "Correcta" u "Omitida" mientras lo estás revisitando,
-    solo se sabe una vez que lo pasaste.
+    "type" es el nombre visible del tipo ("Demostración", "Opción
+    múltiple", "Escriba la respuesta", ...). "status" es el texto del
+    estado ("Completa", "Correcta", "Omitida", "Vuelva a intentarlo") o
+    None. "status_qa" es el `data-qa` del hijo de estado, que es lo que
+    hay que clickear para reabrir la actividad (ver click_activity).
 
-    Usar el `<id>` (en vez de posición/índice) para reintentar cada
-    actividad es más robusto que buscar por texto visible: no se ve
-    afectado por cuántas otras actividades se arreglen o descarten en el
-    camino.
+    Cada actividad es un contenedor `data-qa="activity_<id>"` con un hijo
+    cuyo `data-qa` es ese mismo id más un sufijo de estado — **el sufijo
+    varía según el estado** (confirmado en vivo volcando el DOM):
 
-    Devuelve el `data-qa` COMPLETO del hijo de estado (ej.
-    "activity_<id>_skipped"), no solo el id — **confirmado en vivo que
-    importa cuál de los dos se clickea**: clickear el CONTENEDOR
-    (`activity_<id>`) para reabrir la actividad no siempre funciona igual
-    que clickear el hijo de estado directamente (con el contenedor, una
-    Demostración "Omitida" a veces se saltaba de nuevo en vez de mostrar
-    el video otra vez; con el hijo de estado sí volvía a mostrar el video
-    interactivo, que es el mismo elemento que ya se había probado y
-    confirmado funcionando antes de tener este helper).
+        _completed            -> "Completa"  (contenido no evaluado)
+        _correctly_completed  -> "Correcta"  (ejercicio respondido bien)
+        _skipped              -> "Omitida"
+
+    Por eso no se busca por un sufijo fijo, sino cualquier hijo cuyo
+    data-qa empiece por `activity_<id>_`.
+
+    **Mientras estás PARADO en una actividad, esa no tiene hijo de estado
+    en absoluto** (confirmado en vivo: la actividad en la que estaba la
+    página salía sin estado, y desde el resumen la misma salía "Omitida").
+    Por eso conviene leer esto desde la pantalla de resumen, donde estás
+    parado en `activity_summary` y todas las actividades reales sí tienen
+    su estado (ver go_to_lesson_summary).
     """
     return page.evaluate(
         """
         () => {
-            const qas = [];
+            const out = [];
             document.querySelectorAll('[data-qa^="activity_"]').forEach((el) => {
                 const qa = el.getAttribute('data-qa');
                 const rest = qa.slice('activity_'.length);
-                if (rest.includes('_')) return; // hijo de estado (_completed, _skipped, ...), no el contenedor
-                const text = el.textContent;
-                if (text.includes('Omitida') || text.includes('Vuelva a intentarlo')) {
-                    // Buscar el hijo real cuyo propio texto es el estado.
-                    const child = Array.from(el.querySelectorAll('[data-qa]')).find(
-                        c => c.textContent.trim() === 'Omitida' || c.textContent.trim() === 'Vuelva a intentarlo'
-                    );
-                    qas.push(child ? child.getAttribute('data-qa') : qa);
-                }
+                if (rest.includes('_')) return; // hijo de estado, no el contenedor
+                const titleEl = el.querySelector('[data-qa="ActivityMapTitle"]');
+                const statusEl = Array.from(el.querySelectorAll('[data-qa]')).find(
+                    c => c.getAttribute('data-qa').startsWith(qa + '_')
+                );
+                out.push({
+                    id: rest,
+                    type: titleEl ? titleEl.textContent.trim() : '',
+                    status: statusEl ? statusEl.textContent.trim() : null,
+                    status_qa: statusEl ? statusEl.getAttribute('data-qa') : null,
+                });
             });
-            return qas;
+            return out;
         }
         """
     )
+
+
+def get_pending_activities(page):
+    """
+    Actividades que todavía NO están bien ("Omitida", "Vuelva a
+    intentarlo", o sin estado). Leer esto desde el resumen — ver
+    get_activity_statuses sobre por qué desde otra pantalla se escapa
+    justo la actividad en la que estás parado.
+    """
+    return [
+        a
+        for a in get_activity_statuses(page)
+        if a["id"] not in _NON_ACTIVITY_IDS and a["status"] not in DONE_ACTIVITY_STATUSES
+    ]
+
+
+def all_pending_are_speech(pending):
+    """
+    True si todo lo que queda pendiente requiere grabar la propia voz, es
+    decir: la lección está genuinamente bloqueada y no tiene sentido
+    volver a intentarla en futuras corridas. Una lista vacía NO cuenta
+    como bloqueada (no queda nada pendiente, que es otra cosa).
+    """
+    return bool(pending) and all(a["type"] in SPEECH_ACTIVITY_TYPES for a in pending)
+
+
+def go_to_lesson_summary(page):
+    """
+    Va a la pantalla "Resumen de la lección" haciendo clic en su item del
+    panel lateral (`data-qa="activity_summary"`, estable: no depende del
+    idioma ni de la posición). Devuelve True si se llegó.
+
+    Sirve para dos cosas: es la única pantalla desde la que TODAS las
+    actividades tienen su estado en el panel lateral (ver
+    get_activity_statuses), y su panel central lista explícitamente lo que
+    falta por hacer de la lección.
+    """
+    if has_speech_modal(page):
+        dismiss_speech_modal(page)
+        page.wait_for_timeout(500)
+
+    item = page.locator('[data-qa="activity_summary"]')
+    if item.count() == 0:
+        return False
+
+    try:
+        item.first.click(timeout=5000)
+    except Exception:
+        if has_speech_modal(page):
+            dismiss_speech_modal(page)
+        try:
+            item.first.click(force=True, timeout=5000)
+        except Exception:
+            return False
+
+    page.wait_for_timeout(2000)
+    return page.url.rstrip("/").endswith("/summary")
+
+
+def get_flagged_activity_ids(page):
+    """
+    Devuelve el `data-qa` del hijo de estado de cada actividad marcada
+    "Omitida" o "Vuelva a intentarlo" — que es lo que hay que clickear
+    para reabrirla (ver click_activity).
+
+    **Confirmado en vivo que importa cuál de los dos elementos se
+    clickea**: clickear el CONTENEDOR (`activity_<id>`) no siempre
+    funciona igual que clickear el hijo de estado directamente (con el
+    contenedor, una Demostración "Omitida" a veces se saltaba de nuevo en
+    vez de mostrar el video otra vez; con el hijo de estado sí volvía a
+    mostrar el video interactivo).
+
+    Usar el id estable de cada actividad (en vez de posición o texto
+    visible) es lo que permite recorrer la lista reintentando cada una
+    exactamente una vez, sin importar cuáles se arreglen en el camino.
+    """
+    return [
+        a["status_qa"]
+        for a in get_activity_statuses(page)
+        if a["id"] not in _NON_ACTIVITY_IDS
+        and a["status"] in ("Omitida", "Vuelva a intentarlo")
+    ]
 
 
 def click_activity(page, status_qa):

@@ -193,7 +193,7 @@ FluencyBot/
 ├── requirements.txt
 ├── .env
 ├── .gitignore
-├── blocked_lessons.json   # generado por el bot: lecciones ya confirmadas como bloqueadas
+├── blocked_lessons.json   # generado por el bot: {"curso::lección": {reason, failures, pending}}
 └── README.md
 ```
 
@@ -237,15 +237,27 @@ get_lessons(), start_lesson(), exit_lesson()
 
 # Detección y extracción de ejercicios
 get_current_exercise(), get_exercise_options(), get_cloze_text(), get_cloze_options()
-get_choice_audio_data_uris()  # extrae audio real para opciones solo-audio
+get_cloze_input_text()                                  # blanks de texto libre, marcados ___N___
+get_choice_audio_data_uris()                            # audio real de opciones solo-audio
+get_matching_target_audio_data_uris()                   # audio real de targets solo-audio
 
 # Interacción por tipo de ejercicio
-click_option(), select_cloze_option(), drag_matching_pair()
-submit_answer(), get_feedback_state(), go_to_next_exercise()
+click_option(), select_cloze_option(), fill_cloze_input(), drag_matching_pair()
+submit_answer(), get_feedback_state(), wait_for_feedback(), go_to_next_exercise()
 
-# Pantallas no-ejercicio (informativas, de habla, paginadas)
-has_speech_modal(), dismiss_speech_modal()
+# Pantallas no-ejercicio (informativas, de habla, paginadas, video)
+has_speech_modal(), dismiss_speech_modal(), has_read_aloud_activity()
 has_paginated_content(), advance_paginated_content()
+has_video(), video_is_watched(), skip_video()
+
+# Panel lateral y resumen: el estado REAL de cada actividad
+# (ver "El panel lateral y el resumen" más abajo)
+go_to_lesson_summary()          # única pantalla donde TODAS tienen estado
+get_activity_statuses()         # [{id, type, status, status_qa}, ...]
+get_pending_activities()        # las que no están Correcta/Completa
+get_flagged_activity_ids()      # las Omitida / Vuelva a intentarlo, clickeables
+all_pending_are_speech()        # ¿la lección está bloqueada de verdad?
+click_activity()                # reabre una actividad desde el panel
 ```
 
 ### `ai.py`
@@ -433,21 +445,65 @@ locator.click()
 * [x] **Mensaje corregido** en `run_lesson()`: la rama que salta actividades ya contadas por Rosetta al reanudar (`solved < already_completed`) decía "Ejercicio ya completado antes ... omitiendo sin llamar a la IA", dando a entender que esas actividades estaban bien resueltas. Falso: `already_completed` (el contador "X de Y" de Rosetta) cuenta CUALQUIER actividad ya atravesada, esté "Correcta" u "Omitida"/incorrecta. Confirmado en vivo: el usuario vio que las actividades 2 y 3 de "Résumés, Part II" decían "ya completado" en el log pero mostraban "Omitida" en el panel real de Rosetta. Mensaje corregido para no insinuar que "ya contado" significa "correcto" — pero esto por sí solo NO arreglaba el problema real (ver el siguiente punto, la solución de verdad).
 * [x] **LA SOLUCIÓN DE VERDAD (parcial) — sí se puede re-intentar una actividad marcada "Vuelva a intentarlo"**: cuando el usuario cuestionó (con razón) que solo corregir el mensaje del log era esconder el problema en vez de arreglarlo, se investigó si de verdad no había forma de corregir una actividad ya mal marcada. Resultado, confirmado en vivo: **para ejercicios reales (matching, cloze_dropdown, cloze_input, etc.) marcados "Vuelva a intentarlo" (los fallaste), sí se puede**. Haciendo clic en el item del panel lateral de la lección, Rosetta vuelve a mostrar ese ejercicio interactivo, como si no se hubiera tocado. Probado de punta a punta: se reabrió una "Correspondencia" marcada "Vuelva a intentarlo", se resolvió con la IA real, y el panel pasó a **"Correcta"**.
   - Implementado en `bot.retry_flagged_items()`, llamado en **varias rondas** (`MAX_RETRY_ROUNDS = 5`) al final de `run_lesson()` — no un solo intento, porque cada reapertura da un juego fresco de intentos reales antes de que Rosetta vuelva a revelar/rendirse.
-  - Usa `browser.get_flagged_activity_ids()`, que lee el DOM real del panel lateral (`data-qa="activity_<id>"` con un hijo de estado cuyo sufijo VARÍA según el estado: `_completed` para "Correcta"/"Completa", `_skipped` para "Omitida" — no hay que asumir un sufijo fijo) — más robusto que buscar por texto visible o posición.
+  - Usa `browser.get_flagged_activity_ids()`, que lee el DOM real del panel lateral — más robusto que buscar por texto visible o posición. Ver abajo ("El panel lateral y el resumen") el mapa completo de sufijos de estado, confirmado volcando el DOM.
   - **Bug real encontrado y corregido**: la primera versión usaba `.first` sin registrar qué ya se había intentado — si un item no cambiaba de estado, `.first` seguía apuntando siempre al mismo, y el bucle lo reintentaba sin avanzar (confirmado en vivo: el usuario vio el bot yendo y viniendo entre los mismos dos ejercicios varios minutos). El siguiente intento (cortar toda la pasada al ver una URL repetida) tampoco servía: si el PRIMER item resultaba no arreglable, la función se rendía sin intentar los demás. La solución final usa los IDs estables de cada actividad, tomados una sola vez al principio, recorridos por ID (no por posición) — así cada uno se intenta exactamente una vez sin importar qué se arregle en el camino.
   - Las actividades genuinamente no automatizables (habla grabada, "Lectura en voz alta") se vuelven a omitir con el mismo criterio de siempre — eso es lo único que el usuario aceptó que quede sin resolver.
-* [ ] **LIMITACIÓN REAL CONFIRMADA (no un bug del código) — una Demostración (video) marcada "Omitida" NO se puede recuperar reabriéndola**: se intentó CUATRO VECES en vivo, con distintos ajustes (clic en el contenedor, clic en el hijo de estado exacto, manejo del modal de habla que aparece al reabrir, bucle interno para no saltarse el video tras descartar el modal) y siempre terminó igual: al reabrir, la pantalla no vuelve a mostrar el video interactivo, simplemente avanza hasta "Vocabulario" dejando la Demostración "Omitida" para siempre. Esto es distinto de "Vuelva a intentarlo" (que si funciona al reabrir) — parece ser que Rosetta trata "omitir sin tocar" un video como una decisión permanente, mientras que "intentar y fallar" un ejercicio sí se puede reabrir. **Importante**: esto NO contradice el fix anterior de `video_is_watched()`/`skip_video()` (ese sigue siendo válido y confirmado: un video visto por PRIMERA vez con el fix aplicado sí queda "Completa" correctamente) — el problema es específicamente re-arreglar uno que ya quedó "Omitida" de una corrida/prueba anterior. Mientras el bot nunca omita un video sin verlo primero (que es el comportamiento normal de `run_lesson()`), este caso no debería producirse en una corrida real desde cero.
+* [x] **Conclusión errónea, retractada: NO es una limitación de Rosetta que una Demostración "Omitida" no se pueda reabrir.** Durante cuatro intentos en vivo el video nunca volvía a mostrarse al reabrirlo, y se dio por confirmado que Rosetta trataba "omitir un video sin tocarlo" como una decisión permanente. El usuario rechazó esa conclusión ("no es del rosetta stone, yo sí lo puedo hacer, es una limitación del bot o tuya") y tenía razón. Depurando paso a paso con capturas tras CADA acción apareció la causa real: **el modal de habla ya estaba abierto ANTES del clic en el panel lateral**, y un modal abierto bloquea toda interacción con la página de fondo — el clic no hacía nada (ni con `force=True`) y la URL nunca cambiaba. El bot descartaba el modal *después* del clic, cuando ya era tarde. Corregido en `retry_flagged_items()`: se descarta el modal ANTES de hacer clic, igual que haría una persona. **Lección de método**: cuatro fallos idénticos no prueban que la plataforma no lo permita; prueban que la hipótesis sobre la causa no había cambiado en cuatro intentos.
 * [x] **Bug real encontrado por el usuario: en `cloze_input` el bot escribía la respuesta pero nunca la enviaba**. Causa: `fill_cloze_input()` hacía `.fill(text)` y `resolve_current_exercise()` llamaba a `submit_answer()` inmediatamente después, sin ninguna espera. El botón de enviar es un `<div>` (no un `<button disabled>` real), así que Playwright no espera a que React registre el cambio antes de permitir el clic — el clic ocurría, pero podía caer como no-op silencioso justo antes de que el campo quedara realmente marcado como lleno, dejando el texto visible pero sin enviar. Corregido en dos frentes: `fill_cloze_input()` ahora espera un poco tras escribir, y `resolve_current_exercise()` reintenta el clic de enviar una vez si no aparece feedback ni revelación (red de seguridad general para cualquier tipo, no solo `cloze_input`, ante el mismo patrón de "clic silenciosamente ignorado").
 * [x] **Bug crítico externo encontrado y corregido: el modelo principal de IA dejó de funcionar de un día para otro**: `meta/muse-glimmer-30b` empezó a devolver `404 NotFoundError` en CUALQUIER llamada (confirmado en vivo con una prueba directa a la API, fuera del bot). Ojo: el modelo seguía apareciendo listado en `_client.models.list()` — solo la inferencia real fallaba, así que "sigue en el catálogo" no significa "sigue funcionando". Esto tumbó una corrida completa en cascada: cada ejercicio que necesitaba IA real fallaba 3/3 intentos con el mismo error y la lección quedaba bloqueada, lección tras lección, sin que fuera un problema de contenido — exactamente el tipo de "se salta algo indebido" que más le preocupa al usuario, y esta vez la causa era completamente externa al código. `AUDIO_MODEL` (`nvidia/nemotron-3-nano-omni-30b-a3b-reasoning`) seguía funcionando bien, lo que ayudó a aislar que era el modelo específico y no la cuenta/clave API. Reemplazado por `meta/llama-3.2-11b-vision-instruct` (confirmado en vivo que funciona con texto Y con imágenes reales, y que resuelve correctamente el ejercicio exacto que había fallado). Se limpiaron de `blocked_lessons.json` las lecciones bloqueadas por este bug durante la corrida afectada (no eran bloqueos legítimos de habla).
+
+* [x] **`blocked_lessons.json` dejó de ser una lista plana y permanente.** Antes, cualquier resultado que no fuera "completado" —una actividad de voz, un ejercicio que la IA no supo, o un simple timeout de navegación— metía la lección en el mismo archivo y la excluía para siempre, sin guardar el motivo. Eso lo convirtió en la cicatriz de todos los bugs pasados: durante el apagón de `muse-glimmer-30b` cada lección intentada quedó marcada, y ahí siguieron decenas que el bot sí puede hacer. Caso concreto que lo prueba: `Manage Your Career (B1)::The Perfect Job, Part I` estaba en la lista, y al inspeccionarla resultó estar en 16/17 con un único pendiente de tipo "Escriba la respuesta" — ni siquiera de voz. Ahora el archivo guarda `{"reason", "failures", "pending"}` por lección: solo `reason: "speech"` es definitivo, y un fallo de otro tipo se reintenta hasta `MAX_LESSON_FAILURES = 3` corridas antes de darse por perdido. El formato viejo se migra al leerlo, tratando las entradas sin motivo como revalidables.
+* [x] **El veredicto de una lección ya no sale del contador.** `run_lesson()` termina yendo al resumen y leyendo `browser.get_pending_activities()`: devuelve `"completed"` si no queda nada, `"speech_blocked"` si todo lo pendiente es de voz (`browser.SPEECH_ACTIVITY_TYPES`), y `"failed"` si queda algo que no es de voz — con la lista de tipos pendientes en el log, para saber QUÉ faltó y no solo que faltó algo. Los tipos desconocidos cuentan como resolubles a propósito: dar una lección por bloqueada de más es justo el error que llenó el archivo de falsos positivos.
+* [x] **Las rondas de reintento se deciden contando pendientes reales**, no por lo que devuelve `retry_flagged_items()` (que solo cuenta ejercicios resueltos): una ronda que arreglaba únicamente un video o un Vocabulario devolvía 0 y cortaba las rondas de más.
+* [x] **Un fallo al reabrir una actividad ya no tumba la corrida**: el `data-qa` del hijo de estado cambia en cuanto cambia el estado, así que un item ya inexistente hacía fallar el clic y el `force=True` de respaldo, y esa excepción se escapaba hasta el handler genérico de `main()`. Ahora se captura por actividad y se sigue con la siguiente.
+* [x] **Un ejercicio que la IA no resuelve ya no abandona la lección al instante**: antes había un `return "failed"` que salía de la lección ahí mismo, tirando la segunda oportunidad que dan las rondas de reintento (reabrir desde el panel lateral da un juego fresco de intentos). Ahora corta el recorrido lineal pero pasa igual por los reintentos.
+
+### El panel lateral y el resumen (confirmado volcando el DOM real)
+
+Cada actividad de la lección es un contenedor `data-qa="activity_<id>"` con
+un hijo cuyo `data-qa` es ese mismo id **más un sufijo que cambia según el
+estado** — por eso no hay que asumir un sufijo fijo:
+
+| sufijo del hijo | texto visible | qué significa |
+| --- | --- | --- |
+| `_completed` | "Completa" | contenido no evaluado ya visto (Demostración, Vocabulario, Explicación) |
+| `_correctly_completed` | "Correcta" | ejercicio evaluado respondido bien |
+| `_skipped` | "Omitida" | se pasó por encima sin hacerla |
+
+Dos items del panel no son actividades: `activity_objectives` ("Objetivos
+de la lección") y `activity_summary` ("Resumen de la lección").
+
+Hechos que hacen que `browser.go_to_lesson_summary()` sea el punto de
+lectura correcto:
+
+* **Parado en una actividad, esa actividad no tiene hijo de estado.** Se
+  confirmó con el mismo caso visto desde dos pantallas: estando en ella
+  salía sin estado, y desde el resumen la misma salía `_skipped`/"Omitida".
+  Leer los pendientes desde cualquier otra pantalla se salta justo la que
+  estás viendo. En el resumen estás parado en `activity_summary`, así que
+  todas las actividades reales sí muestran su estado.
+* **`activity_summary` es clickeable y estable** (no depende del idioma ni
+  de la posición); lleva a `…/<lección>/summary`.
+* **El panel central del resumen lista solo lo que falta**: en una lección
+  16/17, `data-qa="step_content"` contenía exactamente un item ("Escriba la
+  respuesta" / "Omitida"). Útil como confirmación visual, pero el panel
+  lateral es mejor fuente porque además trae el id clickeable de cada
+  actividad; el panel central no.
+* **"Omitida" NO cuenta para el contador**: 3 "Completa" + 13 "Correcta" =
+  16 de 17, y la que faltaba era la "Omitida". Distinto de "Vuelva a
+  intentarlo", que sí cuenta aunque esté mal — por eso el contador nunca
+  sirve como veredicto y `run_lesson()` lee el panel lateral en su lugar.
 
 ### Pendiente
 
 * [ ] **PRÓXIMO PASO CONCRETO — corrida real de verificación completa**: con `cloze_input` resuelto con IA real, el bug de `video_is_watched()` corregido, `retry_flagged_items()` reintentando de verdad lo que quede "Omitida"/"Vuelva a intentarlo", y el modelo de IA principal reemplazado (ver el hallazgo del 404), relanzar una corrida completa real (`python bot.py`) de punta a punta con `python -u` (salida sin buffer, necesario para poder leer el log en vivo — con buffer normal no se ve nada hasta que el proceso termina). Revisar que no se omita nada salvo audio/habla, y que `retry_flagged_items()` efectivamente suba el número de "Correcta" en el panel al final de cada lección.
-* [ ] **Riesgo real, expuesto por el incidente del modelo dado de baja**: si la IA falla por un problema de infraestructura (no de contenido) durante los 3 intentos de `resolve_current_exercise()`, la lección queda bloqueada PARA SIEMPRE en `blocked_lessons.json`, indistinguible de un fallo genuino de contenido — aunque el problema se resuelva minutos después (como pasó esta sesión), esa lección nunca se vuelve a intentar sola. No se implementó una distinción entre "la IA no supo la respuesta" y "la IA no pudo ni responder" — sería una mejora real dado que el usuario quiere que NADA quede sin resolver salvo habla.
 * [ ] **Límite real de reintentos de Rosetta, confirmado en vivo**: Rosetta revela la respuesta y da por perdido el ejercicio tras solo **2** intentos fallidos (no 3) — `MAX_ATTEMPTS = 3` en `bot.py` rara vez llega a usarse completo porque `is_answer_revealed()` ya corta antes en el intento 3. Ya no es tan grave como se pensó al principio (ver `retry_flagged_items()`: si falla, se puede re-intentar de verdad al final de la lección), pero sigue limitando cuántos intentos reales tiene la IA antes de la revelación.
 * [ ] **`matching` con audio puro ahora se resuelve de verdad, no se adivina** (implementado, falta confirmar en vivo) — el usuario aclaró que lo ÚNICO omitible es grabar la propia voz; un ejercicio de escucha (aunque sea audio) SÍ se puede resolver. `browser.get_matching_target_audio_data_uris()` captura el audio real de cada target (mismo patrón que `get_choice_audio_data_uris()` para `multiple_choice`) y `ai._solve_matching_audio()` usa `AUDIO_MODEL` para emparejar de verdad. Solo cae en `_blind_guess` si la captura de audio falla técnicamente (ej. servidor de medios caído), no como estrategia por defecto. **Aún no probado en vivo** — implementado por razonamiento/paridad con el patrón ya confirmado de `multiple_choice` de audio, pendiente de verificar con un caso real.
 * [ ] `retry_flagged_items()` se probó en vivo contra `matching` (texto) y Demostración (video), ambos confirmados arreglando el estado a "Correcta"/"Completa". Falta confirmar con `cloze_dropdown`, `cloze_input` y el nuevo `matching` de audio real, y con lecciones que tengan muchos ítems marcados a la vez (ya se corrigió un bug de bucle infinito encontrado en esa situación, ver "Completado").
-* [ ] El tipo "Escriba la respuesta" con 4 sub-preguntas + imagen, descrito en una sesión anterior como visto en "The Perfect Job, Part I", no volvió a aparecer en esta sesión (en su lugar se encontró `cloze_input`, ver "Completado"). Puede que fuera el mismo tipo mal recordado, o uno genuinamente distinto que aún no se ha vuelto a encontrar.
+* [ ] **"Escriba la respuesta" existe de verdad y es un tipo aparte de `cloze_input`** — confirmado leyendo el panel lateral de "Manage Your Career (B1)::The Perfect Job, Part I": la única actividad pendiente de esa lección es de tipo `Escriba la respuesta` y está "Omitida". Sesiones anteriores lo describieron como "4 sub-preguntas + imagen" y luego se dudó si era `cloze_input` mal recordado; el nombre aparece como `ActivityMapTitle` propio, distinto de "Llene los espacios en blanco" (que sí es `cloze_input`/`cloze_dropdown`). Falta abrirlo y mapear su DOM. Es el mejor caso de prueba disponible: una sola actividad pendiente, en una lección que estaba bloqueada sin motivo.
+* [ ] **Verificar en vivo la lógica nueva de bloqueo.** Está probada contra el DOM real volcado (los estados, los pendientes y la decisión `all_pending_are_speech()` se validaron sobre `dom_01_sidebar_resumen.html` fuera de línea) y contra el estado en disco (migración del formato viejo, `speech` definitivo, tope de `failures`), pero **no se ha corrido de punta a punta contra Rosetta**. Lo que falta confirmar: que `go_to_lesson_summary()` funcione también desde mitad de una lección con el modal de habla de por medio, y que una lección resuelta se quite sola de `blocked_lessons.json`.
+* [ ] **`SPEECH_ACTIVITY_TYPES` está incompleta a propósito.** Solo se confirmó "Lectura en voz alta" en vivo; "Pronunciación", "Hablar" y "Habla" están puestas por suposición. Cualquier tipo que no esté en la lista se trata como resoluble (se reintenta), que es el lado seguro del error: si aparece un tipo de voz con otro nombre, la lección se reintentará 3 veces antes de bloquearse en vez de bloquearse al primer intento. Conviene ir confirmando los nombres reales según aparezcan en el log de pendientes.
+* [ ] **Una lección que Rosetta cuenta como 100% pero tiene actividades "Vuelva a intentarlo" no se vuelve a visitar**: `find_next_lesson()` filtra por `completed < total`, y "Vuelva a intentarlo" SÍ cuenta para ese contador (a diferencia de "Omitida"). Habría que recorrer también las lecciones al 100% y mirar su resumen para detectarlas.
 * [ ] Quitar (o dejar, a discreción) la instrumentación temporal `_debug_screenshot_omit` en `bot.py` una vez ya no se necesite revisar capturas — no rompe nada si se deja, solo genera archivos en `debug_omits/`.
 * [ ] Mapear otros tipos de ejercicio que puedan aparecer más adelante (traducción, etc.) — al toparse con uno genuinamente sin nada interactuable, `run_lesson()` se detiene y avisa en vez de fallar en silencio
 * [ ] El soporte de audio no es 100% confiable (servidor de medios y modelo omni son algo flaky) — funciona pero puede necesitar más de un intento

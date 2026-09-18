@@ -19,25 +19,91 @@ MAX_ATTEMPTS = 3
 MAX_SKIPS = 10
 MAX_RETRY_ROUNDS = 5
 
+# Cuántas veces seguidas puede fallar una lección por algo que NO es voz
+# antes de darla por perdida. Un fallo puntual (un flake de navegación, un
+# modelo de IA caído, un tipo de ejercicio que todavía no se soportaba) no
+# debe condenar la lección para siempre: se reintenta en la próxima corrida.
+MAX_LESSON_FAILURES = 3
+
 BLOCKED_LESSONS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "blocked_lessons.json")
+
+# Motivos de bloqueo. Solo "speech" es definitivo: significa que lo único
+# que queda pendiente en esa lección requiere grabar la propia voz.
+BLOCKED_SPEECH = "speech"
+BLOCKED_FAILED = "failed"
 
 
 def _load_blocked_lessons():
     """
-    Claves "curso::lección" (ej. "Speak with Pilots and Airline Mechanics (B1)::Preflight")
-    ya confirmadas como no completables por el bot (por voz, o porque la IA
-    no pudo resolver algo), guardadas entre corridas para no tener que
-    re-entrar y re-verificarlas cada vez.
+    Estado por lección bloqueada, indexado por clave "curso::lección"
+    (ej. "Speak with Pilots and Airline Mechanics (B1)::Preflight"):
+
+        {"reason": "speech"|"failed", "failures": int, "pending": [str, ...]}
+
+    **Por qué esto dejó de ser una lista plana**: antes cualquier
+    resultado que no fuera "completado" —una actividad de voz, un
+    ejercicio que la IA no supo, o un simple timeout de navegación— metía
+    la lección en el mismo archivo y la excluía PARA SIEMPRE, sin guardar
+    el motivo. Eso convirtió el archivo en la cicatriz de todos los bugs
+    pasados en vez de una lista real: durante el apagón del modelo
+    `muse-glimmer-30b` (404 en toda llamada, ver ai.py) cada lección que
+    se intentó quedó marcada, y ahí siguen decenas que el bot sí puede
+    hacer hoy. Con el motivo guardado, solo "speech" es permanente; lo
+    demás se reintenta hasta MAX_LESSON_FAILURES veces.
+
+    Lee también el formato viejo (lista de claves) y lo migra tratando
+    esas entradas como fallos sin confirmar, para que se revaliden en vez
+    de heredar el bloqueo a ciegas.
     """
     if not os.path.exists(BLOCKED_LESSONS_FILE):
-        return set()
+        return {}
     with open(BLOCKED_LESSONS_FILE, "r", encoding="utf-8") as f:
-        return set(json.load(f))
+        data = json.load(f)
+
+    if isinstance(data, list):
+        print(
+            f"blocked_lessons.json está en el formato viejo ({len(data)} lección(es) sin motivo "
+            "guardado); se revalidarán en vez de darlas por bloqueadas."
+        )
+        return {key: {"reason": BLOCKED_FAILED, "failures": 0, "pending": []} for key in data}
+
+    return data
 
 
-def _save_blocked_lessons(keys):
+def _save_blocked_lessons(blocked):
     with open(BLOCKED_LESSONS_FILE, "w", encoding="utf-8") as f:
-        json.dump(sorted(keys), f, indent=2, ensure_ascii=False)
+        json.dump(dict(sorted(blocked.items())), f, indent=2, ensure_ascii=False)
+
+
+def _mark_blocked(blocked, key, reason, pending=()):
+    """
+    Registra el resultado de una lección que no quedó completa. Un bloqueo
+    por voz es definitivo y no acumula fallos; cualquier otro motivo suma
+    un intento fallido y solo se vuelve definitivo al llegar al tope.
+    """
+    previous_failures = blocked.get(key, {}).get("failures", 0)
+    blocked[key] = {
+        "reason": reason,
+        "failures": 0 if reason == BLOCKED_SPEECH else previous_failures + 1,
+        "pending": sorted({a["type"] for a in pending}),
+    }
+    _save_blocked_lessons(blocked)
+    return blocked[key]
+
+
+def _permanently_blocked_keys(blocked):
+    """
+    Las que de verdad no hay que volver a intentar: las de voz, y las que
+    ya agotaron sus reintentos. El resto se vuelve a probar — revalidarlas
+    cuesta una navegación y cero llamadas a la IA, mucho menos que dejar
+    lecciones perfectamente resolubles marcadas para siempre.
+    """
+    return {
+        key
+        for key, state in blocked.items()
+        if state.get("reason") == BLOCKED_SPEECH
+        or state.get("failures", 0) >= MAX_LESSON_FAILURES
+    }
 
 
 # --- Instrumentación temporal para verificar en vivo que solo se omiten
@@ -265,7 +331,15 @@ def retry_flagged_items(page, lesson_title):
             browser.dismiss_speech_modal(page)
             page.wait_for_timeout(500)
 
-        browser.click_activity(page, status_qa)
+        # Un item que ya no exista (su data-qa cambia de sufijo en cuanto
+        # cambia su estado) hace fallar el clic Y el force=True de respaldo.
+        # Sin este try, esa excepción se escapaba hasta el handler genérico
+        # de main() y tumbaba la corrida entera por UNA actividad.
+        try:
+            browser.click_activity(page, status_qa)
+        except Exception as e:
+            print(f"  No se pudo reabrir la actividad '{status_qa}': {e}; sigo con la siguiente.")
+            continue
         page.wait_for_timeout(1500)
 
         # Bucle interno para ESTA MISMA actividad: no basta con un if/elif
@@ -338,7 +412,16 @@ def retry_flagged_items(page, lesson_title):
                     fixed += 1
                 break
 
-    print(f"'{lesson_title}': {fixed}/{len(flagged_status_qas)} actividad(es) marcadas se resolvieron correctamente al reintentarlas.")
+    # Solo se cuentan los EJERCICIOS resueltos: las reparaciones de video,
+    # Vocabulario/Explicación y demás no pasan por resolve_current_exercise
+    # y no tienen un "correcto" que contar aquí. Por eso quien llama NO debe
+    # usar este número para decidir si vale otra ronda — para eso hay que
+    # mirar cuántos pendientes quedan de verdad en el resumen (ver
+    # run_lesson), que sí refleja cualquier tipo de arreglo.
+    print(
+        f"'{lesson_title}': se reintentaron {len(flagged_status_qas)} actividad(es) marcadas; "
+        f"{fixed} ejercicio(s) quedaron correctos (los arreglos de video/contenido no se cuentan aquí)."
+    )
     return fixed
 
 
@@ -359,15 +442,18 @@ def run_lesson(page, lesson_title, already_completed=0, max_skips=MAX_SKIPS):
     actividades quedan pendientes para completarlas a mano; el bot sigue
     con la siguiente lección en vez de bloquearse ahí.
 
-    Al no encontrar más ejercicios ni poder seguir saltando, sale de la
-    lección y confirma contra el contador real de la plataforma si de
-    verdad se completó, en vez de asumirlo — un tipo de ejercicio no
-    soportado también deja de reconocerse y no queremos confundir eso con
-    "lección terminada".
+    Al terminar el recorrido lineal, reintenta desde el panel lateral todo
+    lo que quedó "Omitida"/"Vuelva a intentarlo" y después va al resumen
+    para dictar el veredicto leyendo el estado real de cada actividad.
+    **No se usa el contador de la plataforma para eso**: sube igual esté
+    la respuesta bien o mal, así que no distingue una lección terminada de
+    una llena de actividades incorrectas.
 
-    Devuelve True si la lección quedó completa (o tan completa como se
-    puede sin voz), False si se detuvo por un ejercicio fallido o una
-    pantalla no reconocida ni saltable.
+    Devuelve (resultado, pendientes):
+        "completed"      -> no queda nada pendiente
+        "speech_blocked" -> lo único pendiente requiere grabar la voz
+        "failed"         -> quedó algo pendiente que NO es de voz
+    donde "pendientes" son los dicts de browser.get_pending_activities().
     """
     skips = 0
     solved = 0
@@ -376,7 +462,6 @@ def run_lesson(page, lesson_title, already_completed=0, max_skips=MAX_SKIPS):
     read_aloud_skip_attempts = 0
     video_skip_attempts = 0
     video_completed = False
-    speech_skipped = False
 
     while True:
         if browser.has_speech_modal(page):
@@ -389,7 +474,6 @@ def run_lesson(page, lesson_title, already_completed=0, max_skips=MAX_SKIPS):
                 break
             print(f"'{lesson_title}' tiene actividades de habla (requieren micrófono); las dejo pendientes para ti...")
             browser.dismiss_speech_modal(page)
-            speech_skipped = True
             continue
 
         try:
@@ -402,7 +486,6 @@ def run_lesson(page, lesson_title, already_completed=0, max_skips=MAX_SKIPS):
             # get_current_exercise() ni por un SubmitButton reconocible.
             if "/summary" in page.url:
                 print(f"'{lesson_title}' llegó al resumen sin completar todo (actividades de habla ya descartadas antes en esta sesión).")
-                speech_skipped = True
                 break
 
             # El modal de habla a veces aparece con un pequeño delay después
@@ -429,7 +512,6 @@ def run_lesson(page, lesson_title, already_completed=0, max_skips=MAX_SKIPS):
                     print(f"La actividad de \"Lectura en voz alta\" en '{lesson_title}' no se puede saltar tras varios intentos; abandonando esta lección.")
                     break
                 print(f"'{lesson_title}' tiene una actividad de \"Lectura en voz alta\" (requiere grabarse); la omito a propósito...")
-                speech_skipped = True
                 skip_button = page.locator('[data-qa="SubmitButton"], [data-qa="StartLessonButton"]')
                 if skip_button.count() > 0:
                     skip_button.first.click()
@@ -522,9 +604,13 @@ def run_lesson(page, lesson_title, already_completed=0, max_skips=MAX_SKIPS):
 
         feedback = resolve_current_exercise(page, exercise)
         if feedback != "correct":
-            print(f"No se pudo resolver un ejercicio de '{lesson_title}' (resultado: {feedback}). Saliendo de la lección...")
-            browser.exit_lesson(page)
-            return "failed"
+            # Antes esto salía de la lección de inmediato. Ahora corta el
+            # recorrido lineal pero cae igual en las rondas de reintento de
+            # abajo: el ejercicio que falló queda marcado en el panel
+            # lateral, y reabrirlo desde ahí da un juego fresco de intentos
+            # — abandonar aquí era tirar esa segunda oportunidad.
+            print(f"No se pudo resolver un ejercicio de '{lesson_title}' (resultado: {feedback}); paso a reintentar lo que quedó marcado...")
+            break
         solved += 1
 
     # El objetivo no es solo "completar" la lección (el contador de Rosetta
@@ -534,28 +620,57 @@ def run_lesson(page, lesson_title, already_completed=0, max_skips=MAX_SKIPS):
     # desde el sidebar, Rosetta da un juego fresco de intentos reales antes
     # de volver a revelar/rendirse, así que insistir varias rondas aumenta
     # de verdad las chances de acertar (no es solo repetir lo mismo).
+    #
+    # Cada ronda arranca desde el resumen porque es la única pantalla donde
+    # TODAS las actividades tienen su estado en el panel lateral: parado en
+    # una actividad, esa no tiene hijo de estado, así que leer los
+    # pendientes desde otra pantalla se salta justo la que estás viendo
+    # (confirmado volcando el DOM, ver browser.get_activity_statuses).
+    #
+    # Si vale la pena otra ronda se decide contando los pendientes reales
+    # antes y después, NO por lo que devuelve retry_flagged_items: ese solo
+    # cuenta ejercicios resueltos, así que una ronda que arregló únicamente
+    # un video o un Vocabulario devolvía 0 y cortaba las rondas de más.
+    pending = []
+    previous_pending = None
     for retry_round in range(1, MAX_RETRY_ROUNDS + 1):
-        fixed = retry_flagged_items(page, lesson_title)
-        if fixed == 0:
+        if not browser.go_to_lesson_summary(page):
+            print(f"No se pudo abrir el resumen de '{lesson_title}'; no se puede verificar qué quedó pendiente.")
             break
-        print(f"'{lesson_title}': ronda de reintento {retry_round}/{MAX_RETRY_ROUNDS} arregló {fixed} actividad(es); probando otra ronda por si queda algo más...")
+
+        pending = browser.get_pending_activities(page)
+        if not pending:
+            break
+        if previous_pending is not None and len(pending) >= previous_pending:
+            print(f"'{lesson_title}': la última ronda no cambió nada ({len(pending)} pendiente(s)); no insisto más.")
+            break
+
+        previous_pending = len(pending)
+        print(f"'{lesson_title}': ronda de reintento {retry_round}/{MAX_RETRY_ROUNDS} sobre {len(pending)} pendiente(s)...")
+        retry_flagged_items(page, lesson_title)
+
+    # Veredicto real de la lección, leído del panel lateral y no del
+    # contador: el contador sube igual esté bien o mal, así que no sirve
+    # para saber si algo quedó "Omitida"/"Vuelva a intentarlo".
+    if browser.go_to_lesson_summary(page):
+        pending = browser.get_pending_activities(page)
 
     browser.exit_lesson(page)
 
-    lesson = next((l for l in browser.get_lessons(page) if l["title"] == lesson_title), None)
-    if lesson and lesson["completed"] >= lesson["total"]:
-        print(f"Lección '{lesson_title}' completada ({lesson['completed']}/{lesson['total']}).")
-        return "completed"
+    if not pending:
+        print(f"Lección '{lesson_title}' completada: todas las actividades quedaron Correcta/Completa.")
+        return "completed", pending
 
-    if speech_skipped:
+    detail = ", ".join(f"{a['type']} ({a['status'] or 'sin empezar'})" for a in pending)
+    if browser.all_pending_are_speech(pending):
         print(
-            f"Lección '{lesson_title}' quedó en {lesson['completed']}/{lesson['total']} "
-            "(el resto son actividades de habla pendientes para ti). Sigo con la próxima lección."
+            f"Lección '{lesson_title}': lo único pendiente requiere grabar tu voz [{detail}]. "
+            "La marco como bloqueada de verdad y sigo."
         )
-        return "speech_blocked"
+        return "speech_blocked", pending
 
-    print(f"Lección '{lesson_title}' se detuvo en una pantalla no reconocida ni saltable.")
-    return "failed"
+    print(f"Lección '{lesson_title}' quedó con {len(pending)} actividad(es) pendientes que NO son de voz: {detail}")
+    return "failed", pending
 
 
 def find_next_lesson(page, skip_keys=()):
@@ -606,18 +721,24 @@ def main():
             page.screenshot(path="fluency_builder.png", full_page=True)
             print("Captura guardada: fluency_builder.png")
 
-            blocked_keys = _load_blocked_lessons()
-            if blocked_keys:
-                print(f"{len(blocked_keys)} lección(es) ya confirmadas como bloqueadas (de corridas anteriores), se omiten.")
+            blocked = _load_blocked_lessons()
+            skip_keys = _permanently_blocked_keys(blocked)
+            retryable = len(blocked) - len(skip_keys)
+            if blocked:
+                print(
+                    f"{len(skip_keys)} lección(es) bloqueadas de verdad (voz o {MAX_LESSON_FAILURES} "
+                    f"fallos) se omiten; {retryable} se van a revalidar por si ya son resolubles."
+                )
 
             while True:
-                lesson_title, already_completed, course_title = find_next_lesson(page, skip_keys=blocked_keys)
+                lesson_title, already_completed, course_title = find_next_lesson(page, skip_keys=skip_keys)
                 if lesson_title is None:
                     print("No quedan lecciones pendientes en ningún curso (aparte de las bloqueadas).")
                     return True
 
+                key = f"{course_title}::{lesson_title}"
                 try:
-                    result = run_lesson(page, lesson_title, already_completed=already_completed)
+                    result, pending = run_lesson(page, lesson_title, already_completed=already_completed)
                 except PlaywrightTimeoutError as e:
                     # A veces, tras varios intentos fallidos, la propia
                     # Rosetta Stone avanza sola a la pantalla de resumen (sin
@@ -628,21 +749,48 @@ def main():
                     # quedar marcado como bloqueado (gastando los reintentos
                     # del wrapper en vano). Marcar y seguir con la próxima.
                     print(f"Timeout inesperado en '{lesson_title}': {e}")
-                    print(f"Marcando '{course_title}::{lesson_title}' como bloqueada (fallo irrecuperable) y siguiendo.")
-                    blocked_keys.add(f"{course_title}::{lesson_title}")
-                    _save_blocked_lessons(blocked_keys)
+                    state = _mark_blocked(blocked, key, BLOCKED_FAILED)
+                    print(
+                        f"'{key}': fallo {state['failures']}/{MAX_LESSON_FAILURES} por timeout. "
+                        + ("No se vuelve a intentar." if state["failures"] >= MAX_LESSON_FAILURES
+                           else "Se reintentará en otra corrida.")
+                    )
+                    if state["failures"] >= MAX_LESSON_FAILURES:
+                        skip_keys.add(key)
                     browser.go_to_courses(page)
                     continue
 
-                # Ni "speech_blocked" ni "failed" detienen el bot: se marca la
-                # lección como bloqueada (para no reintentarla en el futuro)
-                # y se sigue con la próxima. Solo un error inesperado (fuera
-                # de run_lesson) pausa de verdad, más abajo.
-                if result in ("speech_blocked", "failed"):
-                    print(f"Marcando '{course_title}::{lesson_title}' como bloqueada y siguiendo con la próxima lección.")
-                    blocked_keys.add(f"{course_title}::{lesson_title}")
-                    _save_blocked_lessons(blocked_keys)
+                # Ni "speech_blocked" ni "failed" detienen el bot: se registra
+                # el resultado y se sigue con la próxima lección. Solo un error
+                # inesperado (fuera de run_lesson) pausa de verdad, más abajo.
+                if result == "completed":
+                    # Pudo estar marcada de antes por un bug ya arreglado o un
+                    # fallo puntual: si ahora quedó completa, que no siga
+                    # ocupando lugar en la lista.
+                    if blocked.pop(key, None) is not None:
+                        _save_blocked_lessons(blocked)
+                        print(f"'{key}' estaba marcada como bloqueada y se completó: la quito de la lista.")
                     continue
+
+                # Se omite el resto de la corrida para esta lección SIEMPRE,
+                # pero solo se deja de intentar en el futuro si el motivo es
+                # definitivo (voz) o si ya agotó sus reintentos.
+                state = _mark_blocked(
+                    blocked, key, BLOCKED_SPEECH if result == "speech_blocked" else BLOCKED_FAILED, pending
+                )
+                if state["reason"] == BLOCKED_SPEECH:
+                    skip_keys.add(key)
+                    print(f"'{key}': bloqueada definitivamente (solo queda voz). Sigo con la próxima.")
+                else:
+                    print(
+                        f"'{key}': fallo {state['failures']}/{MAX_LESSON_FAILURES} "
+                        f"(pendiente: {', '.join(state['pending'])}). "
+                        + ("No se vuelve a intentar." if state["failures"] >= MAX_LESSON_FAILURES
+                           else "Se reintentará en otra corrida.")
+                    )
+                    if state["failures"] >= MAX_LESSON_FAILURES:
+                        skip_keys.add(key)
+                continue
 
         except PlaywrightTimeoutError:
             print()
