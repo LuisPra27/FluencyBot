@@ -469,6 +469,9 @@ locator.click()
 * [x] **`browser.exercise_is_locked()`**: tras agotar los intentos, Rosetta deja los campos `disabled` sin mostrar el aviso que busca `is_answer_revealed()`. Escribir ahí se colgaba 30s esperando a que el campo se habilitara, y encima gastaba una llamada a la IA. Ahora se detecta antes de intentar nada y simplemente se avanza.
 * [x] **`_format_previous_attempts()` estaba en español** mientras el resto del prompt está en inglés, y los modelos chicos lo ignoraban: confirmado en vivo que la IA devolvió **la misma respuesta equivocada tres veces seguidas**, gastando los tres intentos en una sola idea. Reescrito en inglés y en tono imperativo.
 
+* [x] **Bucle infinito por el contador desincronizado de Rosetta.** Confirmado en vivo: el contador de una lección se queda en "16 de 17" aunque el panel lateral muestre las 17 actividades en Correcta/Completa. Como `find_next_lesson()` filtra por ese contador, elegía la misma lección una y otra vez — entrar, no encontrar nada pendiente, salir, repetir. Dos arreglos: (1) `main()` agrega la clave a `skip_keys` ANTES de intentar la lección, así ninguna se intenta más de una vez por corrida pase lo que pase; (2) al terminar completa se relee el contador con `_counter_still_lags()` y, si sigue desfasado, se guarda con `reason: "completed"` para no volver a entrar en futuras corridas. El panel lateral es la fuente de verdad, el contador no.
+* [x] **Un fallo al abrir el resumen se reportaba como lección completada.** `run_lesson()` dejaba `pending = []` cuando `go_to_lesson_summary()` fallaba, y luego `if not pending` lo interpretaba como "no queda nada". Ahora se distingue "no hay pendientes" de "no se pudo mirar": sin verificación devuelve `"failed"`.
+
 ### El panel lateral y el resumen (confirmado volcando el DOM real)
 
 Cada actividad de la lección es un contenedor `data-qa="activity_<id>"` con

@@ -33,9 +33,15 @@ MAX_ACTIVITY_STEPS = 12
 
 BLOCKED_LESSONS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "blocked_lessons.json")
 
-# Motivos de bloqueo. Solo "speech" es definitivo: significa que lo único
-# que queda pendiente en esa lección requiere grabar la propia voz.
+# Motivos por los que no hay que volver a entrar a una lección.
+#   speech    -> lo único pendiente requiere grabar la propia voz.
+#   completed -> el panel lateral confirma que está TODA resuelta, pero el
+#                contador de Rosetta sigue diciendo que falta algo (ver
+#                main()). Definitivo igual que "speech": el panel es la
+#                fuente de verdad, el contador no.
+#   failed    -> quedó algo pendiente que no es de voz; se reintenta.
 BLOCKED_SPEECH = "speech"
+BLOCKED_DONE = "completed"
 BLOCKED_FAILED = "failed"
 
 
@@ -44,7 +50,7 @@ def _load_blocked_lessons():
     Estado por lección bloqueada, indexado por clave "curso::lección"
     (ej. "Speak with Pilots and Airline Mechanics (B1)::Preflight"):
 
-        {"reason": "speech"|"failed", "failures": int, "pending": [str, ...]}
+        {"reason": "speech"|"completed"|"failed", "failures": int, "pending": [str, ...]}
 
     **Por qué esto dejó de ser una lista plana**: antes cualquier
     resultado que no fuera "completado" —una actividad de voz, un
@@ -54,8 +60,8 @@ def _load_blocked_lessons():
     pasados en vez de una lista real: durante el apagón del modelo
     `muse-glimmer-30b` (404 en toda llamada, ver ai.py) cada lección que
     se intentó quedó marcada, y ahí siguen decenas que el bot sí puede
-    hacer hoy. Con el motivo guardado, solo "speech" es permanente; lo
-    demás se reintenta hasta MAX_LESSON_FAILURES veces.
+    hacer hoy. Con el motivo guardado, "speech" y "completed" son
+    definitivos; "failed" se reintenta hasta MAX_LESSON_FAILURES veces.
 
     Lee también el formato viejo (lista de claves) y lo migra tratando
     esas entradas como fallos sin confirmar, para que se revaliden en vez
@@ -83,14 +89,14 @@ def _save_blocked_lessons(blocked):
 
 def _mark_blocked(blocked, key, reason, pending=()):
     """
-    Registra el resultado de una lección que no quedó completa. Un bloqueo
-    por voz es definitivo y no acumula fallos; cualquier otro motivo suma
-    un intento fallido y solo se vuelve definitivo al llegar al tope.
+    Registra por qué no hay que volver a entrar a una lección. "speech" y
+    "completed" son definitivos y no acumulan fallos; solo "failed" suma un
+    intento y se vuelve definitivo al llegar al tope.
     """
     previous_failures = blocked.get(key, {}).get("failures", 0)
     blocked[key] = {
         "reason": reason,
-        "failures": 0 if reason == BLOCKED_SPEECH else previous_failures + 1,
+        "failures": previous_failures + 1 if reason == BLOCKED_FAILED else 0,
         "pending": sorted({a["type"] for a in pending}),
     }
     _save_blocked_lessons(blocked)
@@ -99,15 +105,17 @@ def _mark_blocked(blocked, key, reason, pending=()):
 
 def _permanently_blocked_keys(blocked):
     """
-    Las que de verdad no hay que volver a intentar: las de voz, y las que
-    ya agotaron sus reintentos. El resto se vuelve a probar — revalidarlas
+    Las que de verdad no hay que volver a intentar: las de voz, las ya
+    confirmadas como resueltas por el panel lateral (aunque el contador de
+    Rosetta siga desincronizado), y las que ya agotaron sus reintentos.
+    El resto se vuelve a probar — revalidarlas
     cuesta una navegación y cero llamadas a la IA, mucho menos que dejar
     lecciones perfectamente resolubles marcadas para siempre.
     """
     return {
         key
         for key, state in blocked.items()
-        if state.get("reason") == BLOCKED_SPEECH
+        if state.get("reason") in (BLOCKED_SPEECH, BLOCKED_DONE)
         or state.get("failures", 0) >= MAX_LESSON_FAILURES
     }
 
@@ -803,10 +811,18 @@ def run_lesson(page, lesson_title, already_completed=0, max_skips=MAX_SKIPS):
     # Veredicto real de la lección, leído del panel lateral y no del
     # contador: el contador sube igual esté bien o mal, así que no sirve
     # para saber si algo quedó "Omitida"/"Vuelva a intentarlo".
-    if browser.go_to_lesson_summary(page):
+    verified = browser.go_to_lesson_summary(page)
+    if verified:
         pending = browser.get_pending_activities(page)
 
     browser.exit_lesson(page)
+
+    if not verified:
+        # Sin haber podido leer el resumen no sabemos nada: `pending` está
+        # vacío porque no se pudo mirar, NO porque no quede nada. Darlo por
+        # completado aquí sería inventarse un éxito.
+        print(f"Nunca se pudo abrir el resumen de '{lesson_title}': no hay forma de verificar qué quedó.")
+        return "failed", []
 
     if not pending:
         print(f"Lección '{lesson_title}' completada: todas las actividades quedaron Correcta/Completa.")
@@ -822,6 +838,31 @@ def run_lesson(page, lesson_title, already_completed=0, max_skips=MAX_SKIPS):
 
     print(f"Lección '{lesson_title}' quedó con {len(pending)} actividad(es) pendientes que NO son de voz: {detail}")
     return "failed", pending
+
+
+def _counter_still_lags(page, lesson_title):
+    """
+    Tras salir de una lección estamos en la página de su curso. Devuelve
+    True si el contador de Rosetta SIGUE diciendo que a esa lección le
+    faltan actividades — o sea, que no coincide con el panel lateral, que
+    ya las daba todas por resueltas.
+
+    Confirmado en vivo: el contador se queda desincronizado ("16 de 17")
+    aunque el panel muestre las 17 en Correcta/Completa, y como
+    find_next_lesson() filtra por el contador, la lección se volvía a
+    elegir una y otra vez.
+
+    Ante cualquier problema para leerlo, devuelve True: es el lado seguro
+    (se deja de reintentar esa lección) frente a arriesgarse al bucle.
+    """
+    try:
+        lesson = next((l for l in browser.get_lessons(page) if l["title"] == lesson_title), None)
+    except Exception as e:
+        print(f"(no se pudo releer el contador de '{lesson_title}': {e})")
+        return True
+    if lesson is None:
+        return True
+    return lesson["completed"] < lesson["total"]
 
 
 def find_next_lesson(page, skip_keys=()):
@@ -888,6 +929,14 @@ def main():
                     return True
 
                 key = f"{course_title}::{lesson_title}"
+                # Red de seguridad contra bucles: una lección se intenta
+                # como máximo UNA vez por corrida, pase lo que pase. Sin
+                # esto, cualquier caso en que run_lesson() termine sin que
+                # el contador de Rosetta cambie hace que find_next_lesson()
+                # vuelva a elegir la misma lección para siempre (confirmado
+                # en vivo con el contador desincronizado). La memoria entre
+                # corridas la lleva blocked_lessons.json, no esta variable.
+                skip_keys.add(key)
                 try:
                     result, pending = run_lesson(page, lesson_title, already_completed=already_completed)
                 except PlaywrightTimeoutError as e:
@@ -906,8 +955,6 @@ def main():
                         + ("No se vuelve a intentar." if state["failures"] >= MAX_LESSON_FAILURES
                            else "Se reintentará en otra corrida.")
                     )
-                    if state["failures"] >= MAX_LESSON_FAILURES:
-                        skip_keys.add(key)
                     browser.go_to_courses(page)
                     continue
 
@@ -915,10 +962,21 @@ def main():
                 # el resultado y se sigue con la próxima lección. Solo un error
                 # inesperado (fuera de run_lesson) pausa de verdad, más abajo.
                 if result == "completed":
-                    # Pudo estar marcada de antes por un bug ya arreglado o un
-                    # fallo puntual: si ahora quedó completa, que no siga
-                    # ocupando lugar en la lista.
-                    if blocked.pop(key, None) is not None:
+                    # El contador de Rosetta puede tardar en sincronizar: se
+                    # queda diciendo "16 de 17" aunque el panel lateral ya
+                    # muestre TODAS las actividades en Correcta/Completa.
+                    # find_next_lesson() filtra justamente por ese contador,
+                    # así que sin esto el bot vuelve a elegir la misma
+                    # lección, entra, no encuentra nada pendiente, sale, y
+                    # la vuelve a elegir — bucle infinito confirmado en vivo.
+                    # El panel es la fuente de verdad, no el contador.
+                    if _counter_still_lags(page, lesson_title):
+                        _mark_blocked(blocked, key, BLOCKED_DONE)
+                        print(
+                            f"'{key}': el panel dice que está toda resuelta pero el contador de Rosetta "
+                            "aún no se sincronizó; la doy por hecha y no vuelvo a entrar."
+                        )
+                    elif blocked.pop(key, None) is not None:
                         _save_blocked_lessons(blocked)
                         print(f"'{key}' estaba marcada como bloqueada y se completó: la quito de la lista.")
                     continue
@@ -930,7 +988,6 @@ def main():
                     blocked, key, BLOCKED_SPEECH if result == "speech_blocked" else BLOCKED_FAILED, pending
                 )
                 if state["reason"] == BLOCKED_SPEECH:
-                    skip_keys.add(key)
                     print(f"'{key}': bloqueada definitivamente (solo queda voz). Sigo con la próxima.")
                 else:
                     print(
@@ -939,8 +996,6 @@ def main():
                         + ("No se vuelve a intentar." if state["failures"] >= MAX_LESSON_FAILURES
                            else "Se reintentará en otra corrida.")
                     )
-                    if state["failures"] >= MAX_LESSON_FAILURES:
-                        skip_keys.add(key)
                 continue
 
         except PlaywrightTimeoutError:
