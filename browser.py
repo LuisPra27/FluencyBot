@@ -219,8 +219,28 @@ def start_lesson(page, index):
 
 
 def exit_lesson(page):
-    """Desde dentro de una lección, vuelve a la página de detalle de su curso."""
-    page.get_by_text("Salir de la lección", exact=True).first.click()
+    """
+    Desde dentro de una lección, vuelve a la página de detalle de su curso.
+
+    Confirmado en vivo que algo puede tapar el enlace e interceptar el clic
+    ("...subtree intercepts pointer events"): Playwright lo interpreta como
+    un overlay transitorio y reintenta en bucle hasta agotar los 30s por
+    defecto en vez de fallar rápido. Se descarta el modal de habla primero
+    y, si aun así no se puede, se fuerza el clic — mismo patrón que
+    open_activity().
+    """
+    if has_speech_modal(page):
+        dismiss_speech_modal(page)
+        page.wait_for_timeout(500)
+
+    link = page.get_by_text("Salir de la lección", exact=True).first
+    try:
+        link.click(timeout=5000)
+    except Exception:
+        if has_speech_modal(page):
+            dismiss_speech_modal(page)
+            page.wait_for_timeout(500)
+        link.click(force=True, timeout=5000)
     page.wait_for_timeout(2000)
 
 
@@ -985,8 +1005,19 @@ def submit_answer(page):
 
 def get_feedback_state(page):
     """
-    Devuelve "correct", "incorrect" o None si aún no se envió respuesta.
+    Devuelve "correct", "incorrect", "revealed" o None si aún no se envió
+    respuesta.
+
+    **Ojo con "revealed"**: cuando Rosetta muestra la respuesta correcta
+    tras agotar los intentos, pinta `FeedbackCorrectIcon` (el MISMO icono
+    verde que cuando aciertas de verdad) dentro de un
+    `ShowAnswerFeedback`. Confirmado volcando el DOM. Sin distinguirlos,
+    esta función devolvía "correct" para un ejercicio que en realidad se
+    falló, y el bot lo daba por resuelto — reportando un éxito que no
+    existió. Por eso se mira ShowAnswerFeedback ANTES que el icono.
     """
+    if page.locator('[data-qa="ShowAnswerFeedback"]').count() > 0:
+        return "revealed"
     if page.locator('[data-qa="FeedbackCorrectIcon"]').count() > 0:
         return "correct"
     if page.locator('[data-qa="IncorrectFeedback"]').count() > 0:
@@ -1064,15 +1095,110 @@ def exercise_is_locked(page):
     )
 
 
+SHOW_ANSWER_LABEL = "Mostrar respuesta"
+
+
+def get_exercise_key(page):
+    """
+    Identificador estable del ejercicio que hay en pantalla, para poder
+    recordar su respuesta entre reaperturas y entre corridas.
+
+    Se usa la ruta de la URL, que dentro de una lección es
+    `course/<curso>/<lección>/<actividad>/<paso>` — el índice de actividad
+    sale del orden del panel lateral (fijo) y el de paso del orden dentro
+    de la actividad, así que al reabrirla se llega a la misma ruta.
+    Devuelve None fuera de un ejercicio (ej. en `…/summary`).
+    """
+    parts = page.url.split("//", 1)[-1].split("/", 1)
+    if len(parts) < 2:
+        return None
+    path = parts[1].rstrip("/")
+    tail = path.split("/")
+    if len(tail) < 2 or not tail[-1].isdigit() or not tail[-2].isdigit():
+        return None
+    return path
+
+
 def is_answer_revealed(page):
     """
-    Tras fallar suficientes veces en un ejercicio, Rosetta resalta/marca
-    directamente la respuesta correcta y lo indica con un aviso "Esta es
-    la respuesta correcta.", dejando avanzar sin necesidad de acertar.
-    Detectarlo evita gastar otro intento de IA que de todos modos no
-    haría falta (la respuesta ya quedó aplicada por la propia página).
+    Tras agotar los intentos, Rosetta muestra la respuesta correcta con el
+    aviso "Esta es la respuesta correcta.", dejando avanzar sin acertar.
+
+    Se detecta por `data-qa="ShowAnswerFeedback"` (estable, independiente
+    del idioma) en vez de por ese texto en español.
     """
-    return page.get_by_text("Esta es la respuesta correcta.", exact=True).count() > 0
+    return page.locator('[data-qa="ShowAnswerFeedback"]').count() > 0
+
+
+def can_show_answer(page):
+    """
+    True si el botón del pie ofrece "Mostrar respuesta", o sea que se
+    agotaron los intentos y Rosetta puede revelar la solución.
+
+    Secuencia real del botón, confirmada volcando el DOM tras fallar a
+    propósito: "Omitir" -> (fallo 1) "Volver a intentar" -> (fallo 2)
+    "Mostrar respuesta" -> (clic) "Próxima actividad", ya con la respuesta
+    correcta resaltada en pantalla.
+    """
+    return get_action_button_label(page) == SHOW_ANSWER_LABEL
+
+
+def get_revealed_answer(page, exercise):
+    """
+    Con la respuesta ya revelada en pantalla (ver is_answer_revealed),
+    devuelve la solución correcta en el MISMO formato que produce
+    ai.solve_exercise(), para poder reaplicarla tal cual al reabrir la
+    actividad. Devuelve None si no se puede leer.
+
+    Por qué vale la pena: confirmado en vivo que la revelación NO da
+    crédito — el ejercicio queda mal igual. La única forma de arreglarlo
+    es reabrir la actividad desde el panel lateral, y ahí la IA volvería a
+    adivinar a ciegas con los mismos intentos. Guardar lo que Rosetta
+    enseñó convierte ese caso en un acierto seguro.
+
+    **multiple_choice**: cada opción es un
+    `data-qa="ChoiceButton" data-qa-choice="ChoiceButton_<n>"` (índice
+    estable, 1-based). Al revelar, Rosetta le pone a la opción correcta una
+    clase distinta a la del resto. Los nombres de clase son hashes
+    generados (`css-1jr9iaz-RadioButtonDiv`) que cambian entre despliegues,
+    así que NO se busca una clase concreta: se busca la única que se
+    diferencia de la mayoría. Confirmado volcando el DOM: en las 4 opciones,
+    tres compartían clase y la correcta tenía otra.
+
+    Los demás tipos todavía no están mapeados (habría que volcar el DOM de
+    su estado revelado, uno por uno) y devuelven None, con lo que el bot se
+    comporta igual que antes para ellos.
+    """
+    # Guarda imprescindible: la opción que acabas de marcar MAL también
+    # recibe una clase propia distinta de las demás, así que sin este
+    # chequeo la heurística de "la que se diferencia" devuelve la respuesta
+    # EQUIVOCADA cuando todavía no hay revelación. Solo tiene sentido leer
+    # esto con ShowAnswerFeedback en pantalla.
+    if not is_answer_revealed(page):
+        return None
+
+    if exercise["type"] != "multiple_choice":
+        return None
+
+    index = page.evaluate(
+        """
+        () => {
+            const nodes = Array.from(document.querySelectorAll('[data-qa="ChoiceButton"]'));
+            if (nodes.length < 3) return null;  // sin mayoría clara no se puede decidir
+            const counts = {};
+            nodes.forEach((el) => {
+                const c = el.getAttribute('class') || '';
+                counts[c] = (counts[c] || 0) + 1;
+            });
+            const odd = nodes.filter((el) => counts[el.getAttribute('class') || ''] === 1);
+            if (odd.length !== 1) return null;
+            const choice = odd[0].getAttribute('data-qa-choice') || '';
+            const m = choice.match(/(\\d+)$/);
+            return m ? parseInt(m[1], 10) : null;
+        }
+        """
+    )
+    return {"answer": index} if index else None
 
 
 def go_to_next_exercise(page):

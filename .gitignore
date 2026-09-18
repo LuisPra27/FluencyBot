@@ -4,3 +4,4 @@ __pycache__/
 .env
 *.png
 blocked_lessons.json
+known_answers.json

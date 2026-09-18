@@ -197,6 +197,7 @@ FluencyBot/
 ├── .env
 ├── .gitignore
 ├── blocked_lessons.json   # generado por el bot: {"curso::lección": {reason, failures, pending}}
+├── known_answers.json     # generado por el bot: respuestas que Rosetta enseñó, por ejercicio
 └── README.md
 ```
 
@@ -249,6 +250,7 @@ click_option(), select_cloze_option(), fill_cloze_input(), write_answer(), drag_
 submit_answer(), get_feedback_state(), wait_for_feedback(), go_to_next_exercise()
 get_action_button_label()      # que dice el boton del pie, para no clickear a ciegas
 exercise_is_locked()           # Rosetta ya cerro el ejercicio (campos deshabilitados)
+is_answer_revealed(), can_show_answer(), get_revealed_answer(), get_exercise_key()
 
 # Pantallas no-ejercicio (informativas, de habla, paginadas, video)
 has_speech_modal(), dismiss_speech_modal(), has_read_aloud_activity()
@@ -471,6 +473,39 @@ locator.click()
 
 * [x] **Bucle infinito por el contador desincronizado de Rosetta.** Confirmado en vivo: el contador de una lección se queda en "16 de 17" aunque el panel lateral muestre las 17 actividades en Correcta/Completa. Como `find_next_lesson()` filtra por ese contador, elegía la misma lección una y otra vez — entrar, no encontrar nada pendiente, salir, repetir. Dos arreglos: (1) `main()` agrega la clave a `skip_keys` ANTES de intentar la lección, así ninguna se intenta más de una vez por corrida pase lo que pase; (2) al terminar completa se relee el contador con `_counter_still_lags()` y, si sigue desfasado, se guarda con `reason: "completed"` para no volver a entrar en futuras corridas. El panel lateral es la fuente de verdad, el contador no.
 * [x] **Un fallo al abrir el resumen se reportaba como lección completada.** `run_lesson()` dejaba `pending = []` cuando `go_to_lesson_summary()` fallaba, y luego `if not pending` lo interpretaba como "no queda nada". Ahora se distingue "no hay pendientes" de "no se pudo mirar": sin verificación devuelve `"failed"`.
+
+### El botón del pie y la revelación de la respuesta
+
+Rosetta usa un único `data-qa="SubmitButton"` para todo y solo le cambia el
+texto, que lleva en `data-qa-button-text`. Secuencia real, confirmada
+fallando un ejercicio a propósito y volcando el DOM en cada paso:
+
+| estado | botón | `data-qa` del feedback |
+| --- | --- | --- |
+| nada respondido | "Omitir" | — |
+| tras fallar 1 vez | "Volver a intentar" | `IncorrectFeedback` |
+| tras fallar 2 veces | **"Mostrar respuesta"** | `IncorrectFeedback` |
+| tras pulsarlo | "Próxima actividad" | `ShowAnswerFeedback` |
+
+* **Son solo 2 intentos reales, no 3.** `MAX_ATTEMPTS = 3` nunca se agota:
+  al tercero Rosetta ya solo ofrece enseñar la respuesta.
+* **Bug real que esto destapó**: en el estado revelado Rosetta pinta
+  `FeedbackCorrectIcon` — el MISMO icono verde que cuando aciertas de
+  verdad. `get_feedback_state()` lo leía y devolvía `"correct"`, así que el
+  bot daba por resuelto un ejercicio que en realidad había fallado. Ahora
+  se mira `ShowAnswerFeedback` primero y se devuelve `"revealed"`.
+* **Dónde está la respuesta correcta** (`multiple_choice`): cada opción es
+  un `data-qa="ChoiceButton"` con `data-qa-choice="ChoiceButton_<n>"`
+  (índice estable, 1-based). Al revelar, la correcta recibe una clase
+  distinta a la del resto. Los nombres de clase son hashes generados
+  (`css-1jr9iaz-RadioButtonDiv`) que cambian entre despliegues, así que
+  `get_revealed_answer()` **no busca una clase concreta**: busca la única
+  que se diferencia de la mayoría. Ojo: la opción que marcaste MAL también
+  tiene clase propia, así que la lectura solo es válida con
+  `ShowAnswerFeedback` en pantalla — hay una guarda explícita para eso,
+  porque sin ella la función devolvía la respuesta equivocada.
+
+* [x] **Memoria de las respuestas que Rosetta enseña (`known_answers.json`).** Confirmado desde hace tiempo que la revelación NO da crédito: un ejercicio que llega a "Mostrar respuesta" queda mal igual. La única forma de arreglarlo es reabrir la actividad desde el panel lateral — pero ahí la IA volvía a adivinar a ciegas con los mismos dos intentos, así que lo más probable era fallar otra vez. Ahora el ciclo es: (1) ¿hay respuesta guardada de este ejercicio? se aplica directo, sin gastar IA; (2) si no, se le pregunta a la IA; (3) agotados los intentos se pulsa "Mostrar respuesta" **a propósito**, se lee y se guarda, indexada por `browser.get_exercise_key()` (la ruta del ejercicio dentro del curso, estable entre reaperturas); (4) el ejercicio queda mal en esa pasada, pero la siguiente lo responde de memoria; (5) una vez correcto, la respuesta se borra para no acumular basura. Por ahora solo se sabe leer la de `multiple_choice`; los demás tipos devuelven None y se comportan como antes.
 
 ### El panel lateral y el resumen (confirmado volcando el DOM real)
 

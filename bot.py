@@ -32,6 +32,7 @@ MAX_LESSON_FAILURES = 3
 MAX_ACTIVITY_STEPS = 12
 
 BLOCKED_LESSONS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "blocked_lessons.json")
+KNOWN_ANSWERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "known_answers.json")
 
 # Motivos por los que no hay que volver a entrar a una lección.
 #   speech    -> lo único pendiente requiere grabar la propia voz.
@@ -118,6 +119,54 @@ def _permanently_blocked_keys(blocked):
         if state.get("reason") in (BLOCKED_SPEECH, BLOCKED_DONE)
         or state.get("failures", 0) >= MAX_LESSON_FAILURES
     }
+
+
+def _load_known_answers():
+    """
+    Respuestas que Rosetta ya nos enseñó, indexadas por
+    `browser.get_exercise_key()` (la ruta del ejercicio dentro del curso).
+
+    **Por qué existe**: confirmado en vivo que la revelación NO da crédito
+    — un ejercicio que llega a "Mostrar respuesta" queda mal igual. La
+    única forma de arreglarlo es reabrir la actividad desde el panel
+    lateral, pero ahí la IA volvía a adivinar a ciegas con los mismos dos
+    intentos, así que lo más probable era volver a fallar. Guardando lo
+    que Rosetta enseñó, la reapertura pasa a ser un acierto seguro y sin
+    gastar ni una llamada a la IA.
+
+    Se guarda la solución con el mismo shape que devuelve
+    ai.solve_exercise(), para poder pasársela tal cual a apply_solution().
+    """
+    if not os.path.exists(KNOWN_ANSWERS_FILE):
+        return {}
+    try:
+        with open(KNOWN_ANSWERS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"(no se pudo leer {KNOWN_ANSWERS_FILE}: {e}; empiezo sin respuestas guardadas)")
+        return {}
+
+
+def _save_known_answers(answers):
+    with open(KNOWN_ANSWERS_FILE, "w", encoding="utf-8") as f:
+        json.dump(dict(sorted(answers.items())), f, indent=2, ensure_ascii=False)
+
+
+def _remember_answer(key, solution):
+    answers = _load_known_answers()
+    answers[key] = solution
+    _save_known_answers(answers)
+
+
+def _forget_answer(key):
+    """
+    Una respuesta guardada solo sirve hasta que el ejercicio queda bien: a
+    partir de ahí ocupa espacio sin aportar nada (y si estaba equivocada,
+    peor). Se borra en cuanto cumple su función.
+    """
+    answers = _load_known_answers()
+    if answers.pop(key, None) is not None:
+        _save_known_answers(answers)
 
 
 # --- Instrumentación temporal para verificar en vivo que solo se omiten
@@ -224,11 +273,45 @@ def resolve_current_exercise(page, exercise, max_attempts=MAX_ATTEMPTS):
     intentar" (mismo botón que enviar/avanzar). Confirmado que esto resetea
     la selección en 'multiple_choice'; para 'matching'/'cloze_dropdown' se
     asume el mismo comportamiento pero aún no se verificó en vivo.
+
+    Ciclo completo, con memoria de lo que Rosetta enseñó:
+
+      1. ¿Hay respuesta guardada de este ejercicio? Se aplica directo, sin
+         gastar una llamada a la IA.
+      2. Si no, se le pregunta a la IA (hasta max_attempts veces).
+      3. Agotados los intentos, el botón pasa a "Mostrar respuesta": se
+         pulsa a propósito, se lee la solución y se guarda.
+      4. El ejercicio queda mal igual (la revelación no da crédito), pero
+         al reabrir la actividad desde el panel ya se responde de memoria.
+      5. Una vez correcto, la respuesta guardada se borra.
+
+    Devuelve "correct", "incorrect", "revealed" (se falló pero ya se sabe
+    la respuesta para la próxima) o None.
     """
     print("Ejercicio detectado:", exercise)
 
     previous_attempts = []
     feedback = None
+    key = browser.get_exercise_key(page)
+
+    remembered = _load_known_answers().get(key) if key else None
+    if remembered is not None:
+        print(f"Respuesta ya conocida de este ejercicio: {remembered} (sin gastar IA)")
+        apply_solution(page, exercise, remembered)
+        browser.submit_answer(page)
+        if browser.wait_for_feedback(page) == "correct":
+            browser.go_to_next_exercise(page)
+            page.wait_for_timeout(1500)
+            _forget_answer(key)
+            return "correct"
+        # Guardada pero equivocada (mal leída, o el ejercicio cambió):
+        # no sirve de nada conservarla, y dejarla haría fallar cada
+        # reapertura igual. Se borra y se sigue con la IA normalmente.
+        print("La respuesta guardada no funcionó; la borro y sigo con la IA.")
+        _forget_answer(key)
+        if browser.get_action_button_label(page) == "Volver a intentar":
+            browser.submit_answer(page)
+            page.wait_for_timeout(1000)
 
     for attempt in range(1, max_attempts + 1):
         # Tras un par de fallos, Rosetta a veces revela la respuesta
@@ -239,10 +322,8 @@ def resolve_current_exercise(page, exercise, max_attempts=MAX_ATTEMPTS):
         # de Playwright. Hay que revisar esto antes de intentar aplicar
         # cualquier solución, no solo después de enviarla.
         if browser.is_answer_revealed(page):
-            print("Rosetta ya reveló la respuesta correcta antes de intentar nada más; avanzando.")
-            browser.go_to_next_exercise(page)
-            page.wait_for_timeout(1500)
-            return "correct"
+            print("Rosetta ya tenía la respuesta revelada en pantalla; la guardo y avanzo.")
+            return _capture_revealed_and_advance(page, exercise, key)
 
         # Mismo problema, distinta señal: "Escriba la respuesta" agota sus
         # intentos dejando el campo deshabilitado sin mostrar el aviso que
@@ -310,18 +391,24 @@ def resolve_current_exercise(page, exercise, max_attempts=MAX_ATTEMPTS):
         if feedback == "correct":
             browser.go_to_next_exercise(page)
             page.wait_for_timeout(1500)
+            if key:
+                _forget_answer(key)
             return feedback
 
         if browser.is_answer_revealed(page):
-            # Rosetta ya resaltó la respuesta correcta ella misma tras
-            # varios fallos: no tiene sentido gastar otro intento de IA,
-            # solo avanzar (la respuesta ya quedó aplicada por la página).
-            print("Rosetta reveló la respuesta correcta; avanzando sin gastar otro intento de IA.")
-            browser.go_to_next_exercise(page)
-            page.wait_for_timeout(1500)
-            return "correct"
+            return _capture_revealed_and_advance(page, exercise, key)
 
         previous_attempts.append(solution)
+
+        # Se agotaron los intentos reales y Rosetta ofrece enseñar la
+        # respuesta: pulsarlo a propósito para poder leerla y guardarla.
+        # El ejercicio queda mal igual (la revelación no da crédito), pero
+        # al reabrir la actividad se responderá de memoria y sin IA.
+        if browser.can_show_answer(page):
+            print("Se agotaron los intentos; pulso \"Mostrar respuesta\" para aprenderla.")
+            browser.submit_answer(page)
+            page.wait_for_timeout(1500)
+            return _capture_revealed_and_advance(page, exercise, key)
 
         if attempt < max_attempts:
             # Solo clickear si el botón de verdad ofrece reintentar. Si dice
@@ -337,6 +424,28 @@ def resolve_current_exercise(page, exercise, max_attempts=MAX_ATTEMPTS):
             page.wait_for_timeout(1000)
 
     return feedback
+
+
+def _capture_revealed_and_advance(page, exercise, key):
+    """
+    Con la respuesta revelada en pantalla: leerla, guardarla para la
+    próxima vez que se reabra esta actividad, y avanzar.
+
+    Devuelve "revealed", NO "correct": confirmado en vivo que la
+    revelación no da crédito — el ejercicio queda mal en el panel lateral.
+    Antes esto devolvía "correct" y el bot reportaba como resuelto algo que
+    en realidad había fallado.
+    """
+    solution = browser.get_revealed_answer(page, exercise)
+    if solution is not None and key:
+        _remember_answer(key, solution)
+        print(f"Respuesta aprendida y guardada para la próxima: {solution}")
+    elif solution is None:
+        print(f"Rosetta reveló la respuesta pero no se pudo leer del tipo '{exercise['type']}'.")
+
+    browser.go_to_next_exercise(page)
+    page.wait_for_timeout(1500)
+    return "revealed"
 
 
 def _wait_for_activity_screen(page, timeout_ms=8000, poll_ms=500):
@@ -761,6 +870,14 @@ def run_lesson(page, lesson_title, already_completed=0, max_skips=MAX_SKIPS):
             continue
 
         feedback = resolve_current_exercise(page, exercise)
+        if feedback == "revealed":
+            # Se falló, pero Rosetta enseñó la respuesta y ya quedó
+            # guardada: seguir recorriendo la lección normalmente. Las
+            # pasadas de abajo reabrirán esta actividad y la responderán
+            # de memoria, sin IA y sin adivinar.
+            print("Respuesta aprendida; sigo con el resto de la lección y la arreglo en la pasada de reintentos.")
+            solved += 1
+            continue
         if feedback != "correct":
             # Antes esto salía de la lección de inmediato. Ahora corta el
             # recorrido lineal pero cae igual en las rondas de reintento de
