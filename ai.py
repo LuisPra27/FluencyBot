@@ -58,11 +58,19 @@ def _ask_json(content, max_tokens=3000, model=MODEL):
 
 
 def _format_previous_attempts(previous_attempts):
+    """
+    El resto de los prompts está en inglés; este trozo estaba en español y
+    los modelos chicos lo ignoraban. Confirmado en vivo con
+    "Escriba la respuesta": la IA devolvió LA MISMA respuesta equivocada
+    tres veces seguidas, gastando los tres intentos en una sola idea. De
+    ahí el tono imperativo y el listado explícito de lo ya descartado.
+    """
     if not previous_attempts:
         return ""
     return (
-        "\n\nYa se intentaron estas respuestas y fueron INCORRECTAS, no las repitas: "
-        + json.dumps(previous_attempts)
+        "\n\nIMPORTANT: these answers were already tried and are WRONG. "
+        "Do NOT repeat any of them — give a DIFFERENT answer:\n"
+        + "\n".join(f"  - {json.dumps(a, ensure_ascii=False)}" for a in previous_attempts)
     )
 
 
@@ -194,6 +202,47 @@ def _solve_cloze_input(exercise, previous_attempts):
     return _ask_json(text)
 
 
+def _solve_text_input(exercise, previous_attempts):
+    """
+    "Escriba la respuesta": texto libre, sin opciones. Rosetta compara
+    contra una respuesta esperada concreta, así que la longitud que muestra
+    ("(7 caracteres)") es una pista muy fuerte y se le pasa al modelo para
+    que descarte parafraseos del largo equivocado.
+    """
+    length_hint = exercise.get("expected_length")
+    instructions = exercise.get("instructions")
+    text = (
+        "You are solving an English (B1 level) written-answer exercise. "
+        "There are no options: write the exact answer expected, nothing more.\n"
+        + (f"Instructions shown on screen: {instructions}\n" if instructions else "")
+        + f"Question: {exercise['prompt']}\n"
+    )
+    if length_hint:
+        # Rosetta muestra "(N caracteres)" junto al campo, con el campo aún
+        # vacío. Se le pasa al modelo como pista fuerte de longitud, pero
+        # NO como restricción absoluta: no está confirmado si es la
+        # longitud exacta esperada o un mínimo.
+        text += (
+            f"The page shows a hint that the answer is around {length_hint} "
+            "characters long. Prefer an answer of about that length.\n"
+        )
+    text += (
+        f"{_format_previous_attempts(previous_attempts)}\n\n"
+        'Respond with ONLY a JSON object like {"answer": "driving"} — just '
+        "the answer text, no explanation, no other text, no markdown."
+    )
+
+    image_url = exercise.get("image_url")
+    if not image_url:
+        return _ask_json(text)
+
+    content = [
+        {"type": "text", "text": text},
+        {"type": "image_url", "image_url": {"url": image_url}},
+    ]
+    return _ask_json(content)
+
+
 def _solve_matching(exercise, previous_attempts):
     words = exercise["options"]
     targets = exercise["targets"]
@@ -290,6 +339,8 @@ def solve_exercise(exercise_data: dict, previous_attempts: list | None = None) -
                             "target_audio_urls": [str, ...] opcional (targets solo-audio)}
         cloze_dropdown  -> {"type", "text", "blanks": [[str, ...], ...]}
         cloze_input     -> {"type", "text", "blank_count": int}
+        text_input      -> {"type", "prompt", "instructions", "image_url": str|None,
+                            "expected_length": int|None}
         ordering        -> {"type", "items": [str, ...]}  (en orden desordenado, a reordenar)
 
     previous_attempts: soluciones ya intentadas para este mismo ejercicio que
@@ -302,6 +353,7 @@ def solve_exercise(exercise_data: dict, previous_attempts: list | None = None) -
         multiple_choice -> {"answer": <índice 1-based de la opción>}
         cloze_dropdown  -> {"answers": [<índice 0-based>, ...]}  (uno por blank)
         cloze_input     -> {"answers": [<str>, ...]}  (texto libre, uno por blank)
+        text_input      -> {"answer": <str>}  (respuesta escrita completa)
         matching        -> {"pairs": {<palabra>: <índice 1-based del target>, ...}}
         ordering        -> {"order": [str, ...]}  (los mismos "items", en el orden correcto)
     """
@@ -325,5 +377,8 @@ def solve_exercise(exercise_data: dict, previous_attempts: list | None = None) -
 
     if exercise_type == "ordering":
         return _solve_ordering(exercise_data, previous_attempts)
+
+    if exercise_type == "text_input":
+        return _solve_text_input(exercise_data, previous_attempts)
 
     raise NotImplementedError(f"ai.solve_exercise no soporta el tipo '{exercise_type}'")

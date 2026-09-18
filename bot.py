@@ -25,6 +25,12 @@ MAX_RETRY_ROUNDS = 5
 # debe condenar la lección para siempre: se reintenta en la próxima corrida.
 MAX_LESSON_FAILURES = 3
 
+# Tope de pantallas a trabajar dentro de UNA actividad. Casi todas tienen
+# una sola, pero "Escriba la respuesta" muestra "1 de 4 pasos" en el pie:
+# hay que resolver los cuatro o la actividad queda incompleta. El tope es
+# solo una red de seguridad para no colgarse si algo nunca avanza.
+MAX_ACTIVITY_STEPS = 12
+
 BLOCKED_LESSONS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "blocked_lessons.json")
 
 # Motivos de bloqueo. Solo "speech" es definitivo: significa que lo único
@@ -185,6 +191,9 @@ def apply_solution(page, exercise, solution):
         for blank_index, text in enumerate(solution["answers"], start=1):
             browser.fill_cloze_input(page, blank_index, text)
 
+    elif exercise_type == "text_input":
+        browser.write_answer(page, solution["answer"])
+
     elif exercise_type == "matching":
         for word, target_index in solution["pairs"].items():
             browser.drag_matching_pair(page, word, target_index)
@@ -227,6 +236,18 @@ def resolve_current_exercise(page, exercise, max_attempts=MAX_ATTEMPTS):
             page.wait_for_timeout(1500)
             return "correct"
 
+        # Mismo problema, distinta señal: "Escriba la respuesta" agota sus
+        # intentos dejando el campo deshabilitado sin mostrar el aviso que
+        # busca is_answer_revealed(). Intentar escribir ahí se cuelga
+        # esperando a que el campo se habilite, y encima gasta una llamada
+        # a la IA para nada. Si ya no se puede interactuar, lo único que
+        # queda es avanzar.
+        if browser.exercise_is_locked(page):
+            print("El ejercicio ya no acepta interacción (Rosetta lo dio por cerrado); avanzando.")
+            browser.go_to_next_exercise(page)
+            page.wait_for_timeout(1500)
+            return feedback or "incorrect"
+
         try:
             solution = ai.solve_exercise(exercise, previous_attempts=previous_attempts)
         except Exception as e:
@@ -242,21 +263,41 @@ def resolve_current_exercise(page, exercise, max_attempts=MAX_ATTEMPTS):
 
         print(f"Intento {attempt}/{max_attempts} - Solución de la IA:", solution)
 
+        url_before = page.url
         apply_solution(page, exercise, solution)
+        label_before = browser.get_action_button_label(page)
         browser.submit_answer(page)
 
         feedback = browser.wait_for_feedback(page)
-        if feedback is None and not browser.is_answer_revealed(page):
+        if (
+            feedback is None
+            and not browser.is_answer_revealed(page)
+            and page.url == url_before
+            and browser.get_action_button_label(page) == label_before
+        ):
             # Red de seguridad: el botón de enviar es un <div>, no un
             # <button disabled> real, así que un clic puede caer como
             # no-op silencioso si React todavía no había registrado el
             # cambio (confirmado en vivo con "cloze_input": el texto
-            # quedaba escrito pero nunca se enviaba). Un segundo clic no
-            # hace daño si el primero sí funcionó (ya se habría avanzado o
-            # revelado, y no llegaríamos aquí).
+            # quedaba escrito pero nunca se enviaba).
+            #
+            # Pero re-enviar a ciegas es peligroso: si el primer clic SÍ
+            # había funcionado y el feedback solo tardó, el segundo clic
+            # cae sobre "Volver a intentar"/"Próxima actividad" y avanza de
+            # paso. En una actividad de varios pasos eso salta preguntas
+            # enteras sin responderlas — confirmado en vivo: el bot pasó
+            # del paso 1 al 4 de una "Escriba la respuesta". Por eso solo
+            # se reintenta si NADA cambió: misma URL y el botón sigue
+            # diciendo exactamente lo mismo que antes del clic.
             browser.submit_answer(page)
             feedback = browser.wait_for_feedback(page)
         print("Resultado:", feedback)
+
+        if page.url != url_before:
+            # Rosetta avanzó de paso por su cuenta: este ejercicio ya no
+            # está en pantalla, así que no tiene sentido seguir intentando
+            # (ni reintentar sobre lo que ahora es otra pregunta).
+            return feedback or "incorrect"
 
         if feedback == "correct":
             browser.go_to_next_exercise(page)
@@ -275,154 +316,240 @@ def resolve_current_exercise(page, exercise, max_attempts=MAX_ATTEMPTS):
         previous_attempts.append(solution)
 
         if attempt < max_attempts:
+            # Solo clickear si el botón de verdad ofrece reintentar. Si dice
+            # otra cosa ("Próxima actividad", "Omitir"), el clic avanzaría
+            # de paso en vez de resetear la vista — y en una actividad de
+            # varios pasos eso salta preguntas sin responderlas.
+            label = browser.get_action_button_label(page)
+            if label != "Volver a intentar":
+                print(f"Incorrecto, pero el botón dice {label!r} (ya no se puede reintentar aquí); sigo.")
+                return feedback
             print("Incorrecto, reintentando...")
-            browser.submit_answer(page)  # botón "Volver a intentar": resetea la vista
+            browser.submit_answer(page)  # "Volver a intentar": resetea la vista
             page.wait_for_timeout(1000)
 
     return feedback
 
 
-def retry_flagged_items(page, lesson_title):
+def _wait_for_activity_screen(page, timeout_ms=8000, poll_ms=500):
     """
-    Confirmado en vivo: a diferencia de lo que se asumía antes, Rosetta SÍ
-    permite reabrir una actividad marcada "Omitida" o "Vuelva a
-    intentarlo" — basta con hacer clic en su item del panel lateral de la
-    lección para que vuelva a mostrarse interactiva, como si no se hubiera
-    tocado. Esto significa que las actividades que quedaron mal por la
-    revelación de Rosetta, o genuinamente omitidas, SÍ se pueden re-
-    intentar de verdad en vez de quedar así para siempre.
-
-    **Historial de bugs reales en esta función, todos encontrados en
-    vivo**: primero usaba `.first` sobre el texto visible sin llevar
-    registro de qué ya se había intentado (se quedaba pegada reintentando
-    el mismo item para siempre). Luego se intentó cortar al detectar una
-    URL repetida, pero eso hacía que un solo item no arreglable al
-    principio de la lista abortara toda la pasada, dejando sin intentar
-    items que sí eran arreglables más adelante. La solución definitiva:
-    en vez de posición/texto visible, se usa el ID único y estable de cada
-    actividad (`browser.get_flagged_activity_ids()`, leído directamente
-    del DOM vía `data-qa="activity_<id>_completed"`). Al tomar la lista de
-    IDs UNA sola vez al principio y recorrerla por ID (no por posición),
-    no importa qué se arregle o no en el camino — cada ID se intenta
-    exactamente una vez.
-
-    Algunas actividades (habla, "Lectura en voz alta") seguirán sin poder
-    resolverse y eso es esperado — se vuelven a omitir con el mismo
-    criterio que usa el recorrido normal de la lección, una sola vez, sin
-    insistir.
-
-    Devuelve cuántas actividades quedaron "correct" tras el reintento.
+    Tras saltar a una actividad desde el panel lateral, la pantalla tarda
+    en montarse: justo después del clic puede no haberse detectado todavía
+    ni el video, ni el contenido paginado, ni el ejercicio (confirmado en
+    vivo saltando a una "Explicación" nunca abierta: al instante siguiente
+    la pantalla no era reconocible como nada). Sondea hasta que aparezca
+    algo con lo que trabajar. Devuelve True si apareció.
     """
-    flagged_status_qas = browser.get_flagged_activity_ids(page)
-    if not flagged_status_qas:
+    elapsed = 0
+    while elapsed < timeout_ms:
+        if (
+            browser.has_speech_modal(page)
+            or browser.has_read_aloud_activity(page)
+            or browser.has_video(page)
+            or browser.has_paginated_content(page)
+        ):
+            return True
+        try:
+            browser.get_current_exercise(page, capture_audio=False)
+            return True
+        except NotImplementedError:
+            pass
+        page.wait_for_timeout(poll_ms)
+        elapsed += poll_ms
+    return False
+
+
+def _current_activity_index(page):
+    """
+    Dentro de una lección la URL es `…/<lección>/<actividad>/<paso>` (ej.
+    `…/the-perfect-job-part-i/11/1`). Devuelve el número de actividad, o
+    None si la URL no tiene esa forma (ej. `…/summary`). Sirve para saber
+    si seguimos en la MISMA actividad tras resolver un paso.
+    """
+    parts = page.url.rstrip("/").split("/")
+    if len(parts) >= 2 and parts[-1].isdigit() and parts[-2].isdigit():
+        return parts[-2]
+    return None
+
+
+def _work_single_activity(page, activity):
+    """
+    Trabaja la actividad que está abierta en pantalla ahora mismo, sea del
+    tipo que sea. Devuelve True si resolvió correctamente algún ejercicio.
+
+    Es un bucle, no un if/elif de un solo paso, por dos motivos:
+
+    * Más de una condición puede aplicar en secuencia para la MISMA
+      actividad (ej. abrir una Demostración puede mostrar el modal de habla
+      ANTES de llegar al video). Confirmado en vivo: con un if/elif de un
+      solo paso, al descartar el modal se pasaba directo a la SIGUIENTE
+      actividad sin llegar a ver el video de esta.
+    * Una actividad puede tener VARIOS pasos, cada uno una pantalla aparte
+      ("Escriba la respuesta" muestra "1 de 4 pasos" en el pie). Resolver
+      solo el primero la dejaba incompleta, así que se sigue mientras la
+      URL diga que seguimos en la misma actividad.
+    """
+    activity_index = _current_activity_index(page)
+    solved_any = False
+
+    for _ in range(MAX_ACTIVITY_STEPS):
+        if browser.has_speech_modal(page):
+            browser.dismiss_speech_modal(page)
+            page.wait_for_timeout(500)
+            continue
+
+        if browser.has_read_aloud_activity(page):
+            # Requiere grabarse leyendo: es lo único que se acepta omitir.
+            _click_advance(page)
+            return solved_any
+
+        if browser.has_video(page):
+            if not browser.video_is_watched(page):
+                browser.skip_video(page)
+            # El <video> sigue en el DOM aunque ya se haya visto completo
+            # (ver browser.video_is_watched), así que NO se puede hacer
+            # "continue" aquí: has_video() seguiría dando True para siempre
+            # y nunca se llegaría a hacer clic en el botón de avance. Justo
+            # al terminar el video, Rosetta puede mostrar el modal de habla
+            # encima de ese botón — se descarta antes de intentar el clic.
+            for _ in range(3):
+                if not browser.has_speech_modal(page):
+                    break
+                browser.dismiss_speech_modal(page)
+                page.wait_for_timeout(500)
+            _click_advance(page)
+            return solved_any
+
+        if browser.has_paginated_content(page):
+            # Vocabulario/Explicación: paginar de verdad para que quede
+            # "Completa" en vez de "Omitida".
+            for _ in range(100):
+                if not browser.advance_paginated_content(page):
+                    break
+            _click_advance(page)
+            return solved_any
+
+        try:
+            exercise = browser.get_current_exercise(page)
+        except NotImplementedError:
+            # Pantalla no reconocida (ej. Objetivos, o un video ya visto
+            # esperando el clic de avance): avanzar igual que hace el
+            # recorrido lineal.
+            _click_advance(page)
+            return solved_any
+        else:
+            if resolve_current_exercise(page, exercise) == "correct":
+                solved_any = True
+            # Actividad de varios pasos ("1 de 4 pasos"): seguir mientras
+            # la URL diga que seguimos en la misma. Si cambió de actividad
+            # (o ya no estamos dentro de una), esta ya quedó terminada.
+            now = _current_activity_index(page)
+            if now != activity_index:
+                print(f"  (fin de la actividad {activity_index}; la pantalla pasó a {now} — {page.url})")
+                return solved_any
+
+    return solved_any
+
+
+def _click_advance(page):
+    """Clic en el botón de avance/omitir, si está."""
+    button = page.locator('[data-qa="SubmitButton"], [data-qa="StartLessonButton"]')
+    if button.count() == 0:
+        return False
+    button.first.click()
+    page.wait_for_timeout(1500)
+    return True
+
+
+def work_pending_activities(page, lesson_title):
+    """
+    Hace una pasada por TODO lo que falta de la lección saltando directo a
+    cada actividad desde el panel lateral, sin recorrer la lección entera.
+    Debe llamarse estando en el resumen (ver browser.go_to_lesson_summary).
+
+    Esto sirve para dos cosas a la vez:
+
+    1. **Lecciones a medias**: en vez de entrar y pasar de largo por decenas
+       de actividades ya hechas solo porque falta una del final, se va
+       directo a las que faltan. "Reanudar" siempre reinicia desde el paso
+       1, así que sin esto el coste de arreglar la última actividad de una
+       lección era recorrerla entera.
+    2. **Reintentar lo que quedó mal**: confirmado en vivo que Rosetta deja
+       reabrir una actividad "Omitida"/"Vuelva a intentarlo" desde el panel
+       y da un juego fresco de intentos, así que lo que falló antes no
+       queda así para siempre.
+
+    Las actividades de voz se saltan a propósito (es lo único que el
+    usuario aceptó dejar sin resolver) y ni se abren, para no perder tiempo.
+
+    **Historial de bugs reales aquí, todos encontrados en vivo**: la
+    primera versión usaba `.first` sobre el texto visible sin registrar qué
+    ya se había intentado, y se quedaba pegada reintentando el mismo item
+    para siempre. Luego se intentó cortar al detectar una URL repetida,
+    pero eso hacía que un solo item no arreglable al principio abortara
+    toda la pasada. La solución es la de ahora: tomar la lista de
+    actividades UNA vez al principio y recorrerla por su id único y
+    estable, así cada una se intenta exactamente una vez sin importar qué
+    se arregle en el camino.
+
+    Devuelve en cuántas ACTIVIDADES se resolvió correctamente al menos un
+    ejercicio. Ojo: es por actividad, no por ejercicio (una actividad de
+    varios pasos cuenta una sola vez), y los arreglos de video y de
+    contenido paginado no pasan por resolve_current_exercise() así que no
+    se cuentan. Quien llama NO debe usar este número para decidir si vale
+    otra pasada — para eso hay que volver a contar los pendientes reales en
+    el resumen (ver run_lesson).
+    """
+    pending = browser.get_pending_activities(page)
+    workable = [a for a in pending if a["type"] not in browser.SPEECH_ACTIVITY_TYPES]
+    speech = len(pending) - len(workable)
+
+    if not workable:
         return 0
 
-    print(f"'{lesson_title}': {len(flagged_status_qas)} actividad(es) quedaron marcadas Omitida/Vuelva a intentarlo; reintentando de verdad...")
+    print(
+        f"'{lesson_title}': {len(workable)} actividad(es) pendientes"
+        + (f" (+{speech} de voz que se omiten a propósito)" if speech else "")
+        + "; saltando directo a cada una..."
+    )
     fixed = 0
 
-    for status_qa in flagged_status_qas:
+    for activity in workable:
         # Confirmado en vivo (el bug real detrás de por qué una Demostración
         # "Omitida" nunca se lograba reabrir): si el modal de habla ya está
-        # abierto ANTES de intentar el clic (ej. porque quedó abierto en la
-        # pantalla siguiente a la que se está reintentando), bloquea TODA
-        # interacción con la página de fondo — el clic en el item del
-        # sidebar simplemente no hacía nada, ni con `force=True`, y la URL
-        # nunca cambiaba. Hay que descartarlo primero, igual que haría una
-        # persona, antes de intentar reabrir la actividad.
+        # abierto ANTES del clic, bloquea TODA interacción con la página de
+        # fondo — el clic en el panel simplemente no hacía nada, ni con
+        # force=True, y la URL nunca cambiaba. Hay que descartarlo primero,
+        # igual que haría una persona.
         if browser.has_speech_modal(page):
             browser.dismiss_speech_modal(page)
             page.wait_for_timeout(500)
 
-        # Un item que ya no exista (su data-qa cambia de sufijo en cuanto
-        # cambia su estado) hace fallar el clic Y el force=True de respaldo.
-        # Sin este try, esa excepción se escapaba hasta el handler genérico
-        # de main() y tumbaba la corrida entera por UNA actividad.
+        # Una actividad que ya no exista con ese data-qa (el sufijo cambia
+        # en cuanto cambia el estado) hace fallar el clic Y el force=True de
+        # respaldo. Sin este try, esa excepción se escapaba hasta el handler
+        # genérico de main() y tumbaba la corrida entera por UNA actividad.
         try:
-            browser.click_activity(page, status_qa)
+            browser.open_activity(page, activity)
         except Exception as e:
-            print(f"  No se pudo reabrir la actividad '{status_qa}': {e}; sigo con la siguiente.")
+            print(f"  No se pudo abrir '{activity['type']}': {e}; sigo con la siguiente.")
             continue
-        page.wait_for_timeout(1500)
 
-        # Bucle interno para ESTA MISMA actividad: no basta con un if/elif
-        # de un solo paso, porque más de una condición puede aplicar en
-        # secuencia para la misma actividad (ej. reabrir una Demostración
-        # puede volver a mostrar el modal de habla ANTES de llegar al
-        # video en sí). Confirmado en vivo: con un if/elif de un solo paso,
-        # al descartar el modal se pasaba directo a la SIGUIENTE actividad
-        # de la lista sin nunca llegar a revisar el video de esta.
-        for _ in range(6):
-            if browser.has_speech_modal(page):
-                browser.dismiss_speech_modal(page)
-                page.wait_for_timeout(500)
-                continue
+        if not _wait_for_activity_screen(page):
+            print(f"  '{activity['type']}' no llegó a mostrar nada con lo que trabajar; sigo con la siguiente.")
+            continue
 
-            if browser.has_read_aloud_activity(page):
-                skip_button = page.locator('[data-qa="SubmitButton"]')
-                if skip_button.count() > 0:
-                    skip_button.first.click()
-                    page.wait_for_timeout(1500)
-                break
+        if _work_single_activity(page, activity):
+            fixed += 1
 
-            if browser.has_video(page):
-                if not browser.video_is_watched(page):
-                    browser.skip_video(page)
-                # El <video> sigue en el DOM aunque ya se haya visto
-                # completo (ver browser.video_is_watched), así que NO se
-                # puede simplemente "continue" aquí: has_video() seguiría
-                # dando True para siempre y nunca se llegaría a hacer clic
-                # en el botón de avance. Justo al terminar el video,
-                # Rosetta puede mostrar el modal de habla encima de ese
-                # botón — se descarta aquí mismo antes de intentar el clic.
-                for _ in range(3):
-                    if not browser.has_speech_modal(page):
-                        break
-                    browser.dismiss_speech_modal(page)
-                    page.wait_for_timeout(500)
-                skip_button = page.locator('[data-qa="SubmitButton"]')
-                if skip_button.count() > 0:
-                    skip_button.first.click()
-                    page.wait_for_timeout(1500)
-                break
+        # Volver al resumen deja la página en un punto conocido para el
+        # siguiente salto; si se falla, el propio open_activity de la
+        # próxima vuelta se encarga igual.
+        browser.go_to_lesson_summary(page)
 
-            if browser.has_paginated_content(page):
-                # Vocabulario/Explicación: paginar de verdad (igual que
-                # run_lesson) para que quede "Completa" en vez de "Omitida".
-                for _ in range(100):
-                    if not browser.advance_paginated_content(page):
-                        break
-                skip_button = page.locator('[data-qa="SubmitButton"]')
-                if skip_button.count() > 0:
-                    skip_button.first.click()
-                    page.wait_for_timeout(1500)
-                break
-
-            try:
-                exercise = browser.get_current_exercise(page)
-            except NotImplementedError:
-                # Pantalla no reconocida (ej. Objetivos, o un video ya
-                # visto esperando el clic de avance): omitir/avanzar igual
-                # que hace el recorrido normal.
-                skip_button = page.locator('[data-qa="SubmitButton"], [data-qa="StartLessonButton"]')
-                if skip_button.count() > 0:
-                    skip_button.first.click()
-                    page.wait_for_timeout(1500)
-                break
-            else:
-                feedback = resolve_current_exercise(page, exercise)
-                if feedback == "correct":
-                    fixed += 1
-                break
-
-    # Solo se cuentan los EJERCICIOS resueltos: las reparaciones de video,
-    # Vocabulario/Explicación y demás no pasan por resolve_current_exercise
-    # y no tienen un "correcto" que contar aquí. Por eso quien llama NO debe
-    # usar este número para decidir si vale otra ronda — para eso hay que
-    # mirar cuántos pendientes quedan de verdad en el resumen (ver
-    # run_lesson), que sí refleja cualquier tipo de arreglo.
     print(
-        f"'{lesson_title}': se reintentaron {len(flagged_status_qas)} actividad(es) marcadas; "
-        f"{fixed} ejercicio(s) quedaron correctos (los arreglos de video/contenido no se cuentan aquí)."
+        f"'{lesson_title}': se trabajaron {len(workable)} actividad(es) pendientes; "
+        f"{fixed} con al menos un ejercicio correcto (los arreglos de video/contenido no se cuentan aquí)."
     )
     return fixed
 
@@ -465,7 +592,22 @@ def run_lesson(page, lesson_title, already_completed=0, max_skips=MAX_SKIPS):
     video_skip_attempts = 0
     video_completed = False
 
-    while True:
+    # Lección ya empezada: no tiene sentido recorrerla entera. "Reanudar"
+    # siempre reinicia desde el paso 1, así que con el recorrido lineal el
+    # coste de arreglar la última actividad de una lección de 42 era pasar
+    # de largo por las 41 anteriores, una por una. Desde el resumen se salta
+    # directo a lo que falta (confirmado en vivo que el contenedor del panel
+    # lateral abre incluso actividades nunca tocadas, ver
+    # browser.open_activity), así que el recorrido lineal se reserva para
+    # las lecciones nuevas, donde de todas formas hay que hacerlo todo.
+    linear_walk = already_completed == 0
+    if not linear_walk:
+        print(f"'{lesson_title}' ya está empezada ({already_completed} contadas); voy directo a lo que falta.")
+        if not browser.go_to_lesson_summary(page):
+            print(f"No se pudo abrir el resumen de '{lesson_title}'; recorro la lección entera como antes.")
+            linear_walk = True
+
+    while linear_walk:
         if browser.has_speech_modal(page):
             modal_dismiss_attempts += 1
             if modal_dismiss_attempts > 5:
@@ -623,11 +765,11 @@ def run_lesson(page, lesson_title, already_completed=0, max_skips=MAX_SKIPS):
 
     # El objetivo no es solo "completar" la lección (el contador de Rosetta
     # sube igual esté bien o mal, ver README) sino que quede "Correcta" TODO
-    # lo que no sea grabar la propia voz. Un solo intento de
-    # retry_flagged_items no basta: cada vez que se reabre una actividad
-    # desde el sidebar, Rosetta da un juego fresco de intentos reales antes
-    # de volver a revelar/rendirse, así que insistir varias rondas aumenta
-    # de verdad las chances de acertar (no es solo repetir lo mismo).
+    # lo que no sea grabar la propia voz. Una sola pasada no basta: cada vez
+    # que se reabre una actividad desde el panel, Rosetta da un juego fresco
+    # de intentos reales antes de volver a revelar/rendirse, así que
+    # insistir varias rondas aumenta de verdad las chances de acertar (no es
+    # solo repetir lo mismo).
     #
     # Cada ronda arranca desde el resumen porque es la única pantalla donde
     # TODAS las actividades tienen su estado en el panel lateral: parado en
@@ -636,9 +778,9 @@ def run_lesson(page, lesson_title, already_completed=0, max_skips=MAX_SKIPS):
     # (confirmado volcando el DOM, ver browser.get_activity_statuses).
     #
     # Si vale la pena otra ronda se decide contando los pendientes reales
-    # antes y después, NO por lo que devuelve retry_flagged_items: ese solo
-    # cuenta ejercicios resueltos, así que una ronda que arregló únicamente
-    # un video o un Vocabulario devolvía 0 y cortaba las rondas de más.
+    # antes y después, NO por lo que devuelve work_pending_activities: ese
+    # solo cuenta ejercicios resueltos, así que una ronda que arregló
+    # únicamente un video o un Vocabulario devolvía 0 y cortaba de más.
     pending = []
     previous_pending = None
     for retry_round in range(1, MAX_RETRY_ROUNDS + 1):
@@ -647,15 +789,16 @@ def run_lesson(page, lesson_title, already_completed=0, max_skips=MAX_SKIPS):
             break
 
         pending = browser.get_pending_activities(page)
-        if not pending:
+        workable = [a for a in pending if a["type"] not in browser.SPEECH_ACTIVITY_TYPES]
+        if not workable:
             break
-        if previous_pending is not None and len(pending) >= previous_pending:
-            print(f"'{lesson_title}': la última ronda no cambió nada ({len(pending)} pendiente(s)); no insisto más.")
+        if previous_pending is not None and len(workable) >= previous_pending:
+            print(f"'{lesson_title}': la última ronda no cambió nada ({len(workable)} pendiente(s)); no insisto más.")
             break
 
-        previous_pending = len(pending)
-        print(f"'{lesson_title}': ronda de reintento {retry_round}/{MAX_RETRY_ROUNDS} sobre {len(pending)} pendiente(s)...")
-        retry_flagged_items(page, lesson_title)
+        previous_pending = len(workable)
+        print(f"'{lesson_title}': pasada {retry_round}/{MAX_RETRY_ROUNDS} sobre {len(workable)} pendiente(s)...")
+        work_pending_activities(page, lesson_title)
 
     # Veredicto real de la lección, leído del panel lateral y no del
     # contador: el contador sube igual esté bien o mal, así que no sirve

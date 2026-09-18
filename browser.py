@@ -267,7 +267,7 @@ def get_activity_statuses(page):
     múltiple", "Escriba la respuesta", ...). "status" es el texto del
     estado ("Completa", "Correcta", "Omitida", "Vuelva a intentarlo") o
     None. "status_qa" es el `data-qa` del hijo de estado, que es lo que
-    hay que clickear para reabrir la actividad (ver click_activity).
+    hay que clickear para reabrir la actividad (ver open_activity).
 
     Cada actividad es un contenedor `data-qa="activity_<id>"` con un hijo
     cuyo `data-qa` es ese mismo id más un sufijo de estado — **el sufijo
@@ -373,7 +373,7 @@ def get_flagged_activity_ids(page):
     """
     Devuelve el `data-qa` del hijo de estado de cada actividad marcada
     "Omitida" o "Vuelva a intentarlo" — que es lo que hay que clickear
-    para reabrirla (ver click_activity).
+    para reabrirla (ver open_activity).
 
     **Confirmado en vivo que importa cuál de los dos elementos se
     clickea**: clickear el CONTENEDOR (`activity_<id>`) no siempre
@@ -394,26 +394,38 @@ def get_flagged_activity_ids(page):
     ]
 
 
-def click_activity(page, status_qa):
+def open_activity(page, activity):
     """
-    Hace clic en el hijo de estado ("Omitida"/"Vuelva a intentarlo") de una
-    actividad del panel lateral, identificado por su `data-qa` completo
-    (ver get_flagged_activity_ids) — reabre esa actividad de verdad.
+    Abre una actividad desde el panel lateral, saltando directo a ella sin
+    tener que recorrer la lección entera. `activity` es un dict de
+    get_activity_statuses().
 
-    Confirmado en vivo: reabrir una actividad desde el sidebar puede
-    disparar el modal de habla ("Habilitar actividades de habla") de
-    nuevo, incluso si ya se había descartado antes en la misma sesión.
-    Playwright interpreta el modal como un overlay transitorio y reintenta
-    el clic en bucle hasta agotar el timeout (30s) en vez de fallar rápido
-    o detectar que hay que descartarlo primero.
+    Qué se clickea depende de si la actividad ya tiene estado:
+
+    * **Con estado** (`status_qa`): se clickea el hijo de estado. Confirmado
+      en vivo que importa: clickear el contenedor de una Demostración
+      "Omitida" a veces la volvía a saltar, mientras que el hijo de estado
+      sí volvía a mostrar el video interactivo.
+    * **Sin estado** (nunca tocada, `status_qa is None`): no hay hijo que
+      clickear, así que se usa el contenedor `activity_<id>`. Confirmado en
+      vivo en una lección 0/13: clickear el contenedor de una "Explicación"
+      jamás abierta llevó de `…/summary` a `…/8/1`, o sea directo a esa
+      actividad. Es lo que permite saltarse el recorrido lineal.
+
+    Confirmado en vivo: reabrir una actividad desde el panel puede disparar
+    el modal de habla de nuevo, incluso si ya se descartó antes en la misma
+    sesión. Playwright lo interpreta como un overlay transitorio y reintenta
+    el clic en bucle hasta agotar el timeout (30s) en vez de fallar rápido,
+    así que se descarta explícitamente antes de reintentar.
     """
-    locator = page.locator(f'[data-qa="{status_qa}"]').first
+    qa = activity["status_qa"] or f"activity_{activity['id']}"
+    locator = page.locator(f'[data-qa="{qa}"]').first
     try:
         locator.click(timeout=5000)
     except Exception:
         if has_speech_modal(page):
             dismiss_speech_modal(page)
-        locator.click(force=True)
+        locator.click(force=True, timeout=5000)
 
 
 def has_read_aloud_activity(page):
@@ -710,9 +722,47 @@ def get_current_exercise(page, capture_audio=True):
             "items": get_ordering_items(page),
         }
 
+    if page.locator('[data-qa="TextInput"]').count() > 0:
+        # "Escriba la respuesta": un `<textarea>` de texto libre, con la
+        # pregunta en WritingPracticeTopic-<n> y a veces una imagen de
+        # apoyo. Es una actividad de VARIOS pasos (el pie muestra "1 de 4
+        # pasos"), cada uno en su propia pantalla — quien llama tiene que
+        # seguir resolviendo mientras siga en la misma actividad (ver
+        # bot._work_single_activity).
+        #
+        # Rosetta muestra además la longitud esperada de la respuesta
+        # ("(7 caracteres)"), que es una pista real y muy fuerte para
+        # acertar texto libre, así que se le pasa a la IA.
+        topics = page.locator('[data-qa^="WritingPracticeTopic-"]')
+        prompt = " ".join(topics.nth(i).inner_text().strip() for i in range(topics.count()))
+
+        image = page.locator('[data-qa="step_content"] [data-qa="ContentImage"] img')
+        image_url = image.first.get_attribute("src") if image.count() > 0 else None
+
+        instructions = page.locator('[data-qa="Instructions"]')
+        expected_length = page.evaluate(
+            """
+            () => {
+                const ta = document.querySelector('[data-qa="TextInput"]');
+                if (!ta) return null;
+                const m = (ta.parentElement ? ta.parentElement.textContent : '').match(/\\((\\d+)\\s*caracteres?\\)/);
+                return m ? parseInt(m[1], 10) : null;
+            }
+            """
+        )
+
+        return {
+            "type": "text_input",
+            "prompt": prompt,
+            "instructions": instructions.first.inner_text().strip() if instructions.count() > 0 else "",
+            "image_url": image_url,
+            "expected_length": expected_length,
+        }
+
     raise NotImplementedError(
-        "Tipo de ejercicio no reconocido o aún no mapeado "
-        "(soportados: 'multiple_choice', 'matching', 'cloze_dropdown', 'ordering')."
+        "Tipo de ejercicio no reconocido o aún no mapeado (soportados: "
+        "'multiple_choice', 'matching', 'cloze_dropdown', 'cloze_input', "
+        "'ordering', 'text_input')."
     )
 
 
@@ -906,9 +956,21 @@ def reorder_items(page, target_order):
 
 
 def write_answer(page, answer):
-    raise NotImplementedError(
-        "Pendiente: tipo de ejercicio de texto libre aún no encontrado/mapeado."
-    )
+    """
+    Escribe en el `<textarea data-qa="TextInput">` de "Escriba la respuesta".
+
+    Espera un poco tras escribir por el mismo motivo que fill_cloze_input():
+    el botón de enviar es un `<div>`, no un `<button disabled>` real, así
+    que Playwright no espera a que React registre el cambio antes de
+    permitir el clic y un envío inmediato puede caer como no-op silencioso.
+    """
+    # Timeout corto a propósito: tras enviar, Rosetta deshabilita el
+    # textarea, y con el timeout por defecto (30s) un intento de escribir
+    # en ese estado se queda colgado medio minuto antes de fallar. Si no
+    # se puede escribir, quien llama ya debería haberlo detectado con
+    # exercise_is_locked() — que falle rápido y se vea.
+    page.locator('[data-qa="TextInput"]').first.fill(answer, timeout=5000)
+    page.wait_for_timeout(300)
 
 
 def submit_answer(page):
@@ -951,6 +1013,55 @@ def wait_for_feedback(page, timeout_ms=8000, poll_ms=250):
         page.wait_for_timeout(poll_ms)
         elapsed += poll_ms
     return get_feedback_state(page)
+
+
+def get_action_button_label(page):
+    """
+    Texto del botón de acción del pie. Rosetta reutiliza el MISMO
+    `data-qa="SubmitButton"` para todo y solo le cambia el texto, que lleva
+    además en `data-qa-button-text`: "Omitir" (campo vacío), "Revisar
+    respuesta" (hay algo escrito sin enviar), "Volver a intentar" (fallaste),
+    "Próxima actividad" (acertaste).
+
+    Sirve para no hacer clics a ciegas: confirmado en vivo que un clic de
+    más en ese botón avanza de paso, y en una actividad de varios pasos eso
+    se salta preguntas enteras sin responderlas (el bot pasó del paso 1 al 4
+    de una "Escriba la respuesta", dejando dos preguntas sin tocar).
+    """
+    button = page.locator('[data-qa="SubmitButton"]')
+    if button.count() == 0:
+        return None
+    return button.first.get_attribute("data-qa-button-text") or button.first.inner_text().strip()
+
+
+def exercise_is_locked(page):
+    """
+    True si el ejercicio de la pantalla tiene campos de entrada pero TODOS
+    están deshabilitados, o sea que Rosetta ya lo dio por cerrado y no
+    acepta más interacción.
+
+    Confirmado en vivo con "Escriba la respuesta": al enviar, el
+    `<textarea>` pasa a `disabled` y el botón cambia a "Volver a intentar";
+    hasta hacer clic ahí, cualquier intento de escribir se queda esperando
+    a que el campo se habilite (30s hasta el timeout de Playwright). Tras
+    agotar los intentos, Rosetta muestra la respuesta y el campo se queda
+    deshabilitado para siempre — sin este chequeo, el bot insistía contra
+    un campo que nunca se iba a volver a habilitar.
+
+    Es un chequeo genérico (no por tipo) porque el mismo patrón ya había
+    causado cuelgues de 30s con los dropdowns de 'cloze_dropdown'.
+    """
+    return page.evaluate(
+        """
+        () => {
+            const els = document.querySelectorAll(
+                '[data-qa="TextInput"], [data-qa="ClozeInput"], [data-qa^="ClozeDropdown_"]'
+            );
+            if (!els.length) return false;
+            return Array.from(els).every((el) => el.disabled === true);
+        }
+        """
+    )
 
 
 def is_answer_revealed(page):
