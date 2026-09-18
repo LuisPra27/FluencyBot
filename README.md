@@ -8,6 +8,37 @@ El objetivo del proyecto es crear un bot capaz de **detectar, interpretar y reso
 
 La IA será el componente encargado de resolver los ejercicios. Playwright será el componente encargado de interactuar con la plataforma.
 
+### El criterio de éxito (lo que de verdad importa)
+
+> **Todo tiene que quedar resuelto CORRECTAMENTE. Lo único que se puede
+> dejar omitido son las actividades en las que hay que hablar.**
+
+Esto no es un matiz: es el criterio contra el que se mide cualquier cambio
+en este proyecto, y varias decisiones de diseño existen solo por él.
+
+* **"Completado" NO es lo mismo que "correcto".** El contador de Rosetta
+  ("X de Y actividades completadas") sube igual estés bien o mal, así que
+  **nunca** sirve como señal de éxito. La única fuente de verdad es el
+  estado por actividad del panel lateral: `Correcta` / `Completa` cuentan;
+  `Omitida` y `Vuelva a intentarlo` no. Por eso `run_lesson()` dicta su
+  veredicto leyendo el panel desde el resumen, no el contador.
+* **Que Rosetta te enseñe la respuesta tampoco te da crédito.** Un
+  ejercicio que llega a "Mostrar respuesta" queda mal igual. Por eso el bot
+  aprende esa respuesta, reabre la actividad desde el panel y la responde
+  de verdad (ver `known_answers.json`).
+* **Omitir es la excepción, no el atajo.** Solo se aceptan sin resolver las
+  actividades que exigen grabar la propia voz
+  (`browser.SPEECH_ACTIVITY_TYPES`). Cualquier otro tipo que no se sepa
+  resolver es un hueco a tapar, no un caso aceptable: un ejercicio de
+  ESCUCHA (audio) sí se resuelve — se captura el audio y lo escucha el
+  modelo de audio.
+* **Un tipo desconocido se trata como resoluble.** Ante la duda, se
+  reintenta en vez de darse por bloqueado; dar lecciones por perdidas de
+  más es el error que llenó `blocked_lessons.json` de falsos positivos.
+* **Nada de éxitos inventados.** Si no se pudo verificar el estado (por
+  ejemplo, no se pudo abrir el resumen), el resultado es `failed`, no
+  "completado".
+
 ### Flujo principal
 
 ```text
@@ -494,19 +525,36 @@ fallando un ejercicio a propósito y volcando el DOM en cada paso:
   verdad. `get_feedback_state()` lo leía y devolvía `"correct"`, así que el
   bot daba por resuelto un ejercicio que en realidad había fallado. Ahora
   se mira `ShowAnswerFeedback` primero y se devuelve `"revealed"`.
-* **Dónde está la respuesta correcta** (`multiple_choice`): cada opción es
-  un `data-qa="ChoiceButton"` con `data-qa-choice="ChoiceButton_<n>"`
-  (índice estable, 1-based). Al revelar, la correcta recibe una clase
-  distinta a la del resto. Los nombres de clase son hashes generados
+**Dónde está la respuesta correcta, por tipo.** Se volcó el DOM revelado de
+cada tipo por separado, fallando un ejercicio a propósito hasta llegar a
+"Mostrar respuesta". El hallazgo clave: **salvo en `multiple_choice`,
+Rosetta escribe la respuesta correcta directamente en los propios
+controles**, así que leerla es trivial.
+
+| tipo | dónde queda la respuesta | qué guarda `get_revealed_answer()` |
+| --- | --- | --- |
+| `multiple_choice` | la opción correcta recibe una clase distinta a la del resto | `{"answer": <n>}` (1-based, de `data-qa-choice`) |
+| `text_input` | el `<textarea data-qa="TextInput">` pasa a contenerla | `{"answer": "experience"}` |
+| `cloze_input` | cada `[data-qa="ClozeInput"]` queda con su texto | `{"answers": ["power"]}` |
+| `cloze_dropdown` | cada `ClozeDropdown_<n>` queda con su opción elegida | `{"answers": ["out", "were", ...]}` (texto, no índice) |
+| `matching` | cada palabra queda colocada en su destino correcto | `{"pairs": {"<palabra>": <destino>}}` |
+| `ordering` | los ítems quedan reordenados correctamente | `{"order": [...]}` |
+
+* En `cloze_dropdown` se guarda el **texto** de la opción, no su índice:
+  `select_cloze_option()` acepta ambos y el texto no depende del orden del
+  menú.
+* En `multiple_choice` los nombres de clase son hashes generados
   (`css-1jr9iaz-RadioButtonDiv`) que cambian entre despliegues, así que
-  `get_revealed_answer()` **no busca una clase concreta**: busca la única
-  que se diferencia de la mayoría. Ojo: la opción que marcaste MAL también
-  tiene clase propia, así que la lectura solo es válida con
-  `ShowAnswerFeedback` en pantalla — hay una guarda explícita para eso,
-  porque sin ella la función devolvía la respuesta equivocada.
+  **no se busca una clase concreta**: se busca la única que se diferencia
+  de la mayoría. Ojo: la opción que marcaste MAL también tiene clase
+  propia, así que la lectura solo vale con `ShowAnswerFeedback` en
+  pantalla — hay una guarda explícita, porque sin ella la función devolvía
+  la respuesta equivocada (lo atrapó un test contra el DOM volcado).
+* En `matching` se exige que TODOS los destinos tengan palabra colocada:
+  una lectura incompleta dejaría el ejercicio mal igual al aplicarla.
 
 * [x] **La ronda de reintentos que APRENDE ya no se desperdicia.** El bucle de `run_lesson()` decidía si valía otra pasada contando los pendientes, y una pasada en la que la IA falla y Rosetta enseña la respuesta **no baja ese contador** (el ejercicio sigue mal) — aunque es la pasada más valiosa, porque deja la respuesta guardada. Cortaba justo ahí y el aprendizaje no se usaba hasta la corrida siguiente. Ahora la condición de corte también mira si se aprendió algo nuevo, así la pasada que aprende y la que aplica ocurren en la MISMA corrida.
-* [x] **Memoria de las respuestas que Rosetta enseña (`known_answers.json`).** Confirmado desde hace tiempo que la revelación NO da crédito: un ejercicio que llega a "Mostrar respuesta" queda mal igual. La única forma de arreglarlo es reabrir la actividad desde el panel lateral — pero ahí la IA volvía a adivinar a ciegas con los mismos dos intentos, así que lo más probable era fallar otra vez. Ahora el ciclo es: (1) ¿hay respuesta guardada de este ejercicio? se aplica directo, sin gastar IA; (2) si no, se le pregunta a la IA; (3) agotados los intentos se pulsa "Mostrar respuesta" **a propósito**, se lee y se guarda, indexada por `browser.get_exercise_key()` (la ruta del ejercicio dentro del curso, estable entre reaperturas); (4) el ejercicio queda mal en esa pasada, pero la siguiente lo responde de memoria; (5) una vez correcto, la respuesta se borra para no acumular basura. Por ahora solo se sabe leer la de `multiple_choice`; los demás tipos devuelven None y se comportan como antes.
+* [x] **Memoria de las respuestas que Rosetta enseña (`known_answers.json`).** Confirmado desde hace tiempo que la revelación NO da crédito: un ejercicio que llega a "Mostrar respuesta" queda mal igual. La única forma de arreglarlo es reabrir la actividad desde el panel lateral — pero ahí la IA volvía a adivinar a ciegas con los mismos dos intentos, así que lo más probable era fallar otra vez. Ahora el ciclo es: (1) ¿hay respuesta guardada de este ejercicio? se aplica directo, sin gastar IA; (2) si no, se le pregunta a la IA; (3) agotados los intentos se pulsa "Mostrar respuesta" **a propósito**, se lee y se guarda, indexada por `browser.get_exercise_key()` (la ruta del ejercicio dentro del curso, estable entre reaperturas); (4) el ejercicio queda mal en esa pasada, pero la siguiente lo responde de memoria; (5) una vez correcto, la respuesta se borra para no acumular basura. Cubre los seis tipos (ver la tabla de arriba). Cada extractor está probado contra el DOM real volcado de su tipo.
 
 ### El panel lateral y el resumen (confirmado volcando el DOM real)
 

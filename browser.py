@@ -1156,18 +1156,28 @@ def get_revealed_answer(page, exercise):
     adivinar a ciegas con los mismos intentos. Guardar lo que Rosetta
     enseñó convierte ese caso en un acierto seguro.
 
-    **multiple_choice**: cada opción es un
-    `data-qa="ChoiceButton" data-qa-choice="ChoiceButton_<n>"` (índice
-    estable, 1-based). Al revelar, Rosetta le pone a la opción correcta una
-    clase distinta a la del resto. Los nombres de clase son hashes
-    generados (`css-1jr9iaz-RadioButtonDiv`) que cambian entre despliegues,
-    así que NO se busca una clase concreta: se busca la única que se
-    diferencia de la mayoría. Confirmado volcando el DOM: en las 4 opciones,
-    tres compartían clase y la correcta tenía otra.
+    Confirmado volcando el DOM de cada tipo por separado (fallando un
+    ejercicio a propósito hasta llegar a "Mostrar respuesta"): **salvo en
+    multiple_choice, Rosetta escribe la respuesta correcta directamente en
+    los propios controles**, así que basta con leerlos.
 
-    Los demás tipos todavía no están mapeados (habría que volcar el DOM de
-    su estado revelado, uno por uno) y devuelven None, con lo que el bot se
-    comporta igual que antes para ellos.
+    * `multiple_choice`: cada opción es un `data-qa="ChoiceButton"` con
+      `data-qa-choice="ChoiceButton_<n>"` (índice estable, 1-based). Al
+      revelar, la correcta recibe una clase distinta a la del resto. Los
+      nombres son hashes generados (`css-1jr9iaz-RadioButtonDiv`) que
+      cambian entre despliegues, así que NO se busca una clase concreta:
+      se busca la única que se diferencia de la mayoría.
+    * `text_input`: el `<textarea data-qa="TextInput">` pasa a contener la
+      respuesta correcta.
+    * `cloze_input`: cada `[data-qa="ClozeInput"]` queda con su texto
+      correcto.
+    * `cloze_dropdown`: cada `ClozeDropdown_<n>` queda con la opción
+      correcta seleccionada; se guarda su TEXTO, que select_cloze_option()
+      acepta igual que un índice y no depende del orden del menú.
+    * `matching`: cada palabra queda colocada en su destino correcto, así
+      que el `DragDropText` que hay dentro de cada `MatchingDropTarget` es
+      la pareja buena.
+    * `ordering`: los ítems quedan reordenados correctamente.
     """
     # Guarda imprescindible: la opción que acabas de marcar MAL también
     # recibe una clase propia distinta de las demás, así que sin este
@@ -1177,28 +1187,80 @@ def get_revealed_answer(page, exercise):
     if not is_answer_revealed(page):
         return None
 
-    if exercise["type"] != "multiple_choice":
-        return None
+    kind = exercise["type"]
 
-    index = page.evaluate(
-        """
-        () => {
-            const nodes = Array.from(document.querySelectorAll('[data-qa="ChoiceButton"]'));
-            if (nodes.length < 3) return null;  // sin mayoría clara no se puede decidir
-            const counts = {};
-            nodes.forEach((el) => {
-                const c = el.getAttribute('class') || '';
-                counts[c] = (counts[c] || 0) + 1;
-            });
-            const odd = nodes.filter((el) => counts[el.getAttribute('class') || ''] === 1);
-            if (odd.length !== 1) return null;
-            const choice = odd[0].getAttribute('data-qa-choice') || '';
-            const m = choice.match(/(\\d+)$/);
-            return m ? parseInt(m[1], 10) : null;
-        }
-        """
-    )
-    return {"answer": index} if index else None
+    if kind == "multiple_choice":
+        index = page.evaluate(
+            """
+            () => {
+                const nodes = Array.from(document.querySelectorAll('[data-qa="ChoiceButton"]'));
+                if (nodes.length < 3) return null;  // sin mayoría clara no se puede decidir
+                const counts = {};
+                nodes.forEach((el) => {
+                    const c = el.getAttribute('class') || '';
+                    counts[c] = (counts[c] || 0) + 1;
+                });
+                const odd = nodes.filter((el) => counts[el.getAttribute('class') || ''] === 1);
+                if (odd.length !== 1) return null;
+                const m = (odd[0].getAttribute('data-qa-choice') || '').match(/(\\d+)$/);
+                return m ? parseInt(m[1], 10) : null;
+            }
+            """
+        )
+        return {"answer": index} if index else None
+
+    if kind == "text_input":
+        field = page.locator('[data-qa="TextInput"]')
+        if field.count() == 0:
+            return None
+        value = field.first.input_value().strip()
+        return {"answer": value} if value else None
+
+    if kind == "cloze_input":
+        fields = page.locator('[data-qa="ClozeInput"]')
+        values = [fields.nth(i).input_value().strip() for i in range(fields.count())]
+        return {"answers": values} if values and all(values) else None
+
+    if kind == "cloze_dropdown":
+        labels = page.evaluate(
+            """
+            () => {
+                const out = [];
+                for (let i = 1; ; i++) {
+                    const el = document.querySelector(`[data-qa="ClozeDropdown_${i}"]`);
+                    if (!el) break;
+                    const label = el.querySelector('[data-qa="MenuButtonLabel"]');
+                    out.push(label ? label.textContent.trim() : '');
+                }
+                return out;
+            }
+            """
+        )
+        return {"answers": labels} if labels and all(labels) else None
+
+    if kind == "matching":
+        pairs = page.evaluate(
+            """
+            () => {
+                const targets = Array.from(document.querySelectorAll('[data-qa="MatchingDropTarget"]'));
+                const pairs = {};
+                targets.forEach((t, i) => {
+                    const word = t.querySelector('[data-qa="DragDropText"]');
+                    if (word) pairs[word.textContent.trim()] = i + 1;
+                });
+                // Si algún destino quedó vacío la lectura está incompleta y
+                // aplicarla dejaría el ejercicio mal igual.
+                return Object.keys(pairs).length === targets.length ? pairs : null;
+            }
+            """
+        )
+        return {"pairs": pairs} if pairs else None
+
+    if kind == "ordering":
+        items = get_ordering_items(page)
+        return {"order": items} if items else None
+
+    return None
 
 
 def go_to_next_exercise(page):
