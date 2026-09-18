@@ -2,10 +2,18 @@
 Integración con el modelo de IA encargado de resolver los ejercicios.
 
 Usa la API de NVIDIA build (https://build.nvidia.com), compatible con el SDK
-de OpenAI. Modelo principal: meta/muse-glimmer-30b (texto + imágenes, lo que
-hace falta para "matching" con imágenes). Para opciones que son solo audio
-(sin texto legible) se usa nvidia/nemotron-3-nano-omni-30b-a3b-reasoning, que
-sí entiende audio (muse-glimmer no).
+de OpenAI. Modelo principal: meta/llama-3.2-11b-vision-instruct (texto +
+imágenes, lo que hace falta para "matching" con imágenes). Para opciones que
+son solo audio (sin texto legible) se usa
+nvidia/nemotron-3-nano-omni-30b-a3b-reasoning, que sí entiende audio (el
+modelo principal no).
+
+NOTA: el modelo principal era antes meta/muse-glimmer-30b, dado de baja por
+NVIDIA sin aviso entre sesiones — empezó a devolver 404 en cualquier llamada
+de un día para otro (confirmado en vivo: seguía apareciendo en
+`_client.models.list()` pero la inferencia fallaba). Si este modelo también
+deja de funcionar en el futuro, revisar `_client.models.list()` para ver
+qué sigue disponible antes de asumir que es un bug del código.
 """
 
 import json
@@ -15,7 +23,7 @@ from openai import OpenAI
 
 import config
 
-MODEL = "meta/muse-glimmer-30b"
+MODEL = "meta/llama-3.2-11b-vision-instruct"
 AUDIO_MODEL = "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"
 
 _client = OpenAI(base_url="https://integrate.api.nvidia.com/v1", api_key=config.AI_API_KEY)
@@ -170,9 +178,28 @@ def _solve_cloze_dropdown(exercise, previous_attempts):
     return _ask_json(prompt)
 
 
+def _solve_cloze_input(exercise, previous_attempts):
+    text = (
+        "You are solving an English (B1 level) fill-in-the-blank exercise. "
+        "There are no options to choose from — you must supply the exact "
+        "word or short phrase that belongs in each blank, based on context "
+        "and grammar.\n"
+        "Each blank in the text is marked exactly where it goes as ___N___ "
+        "(e.g. ___1___ is where blank 1 goes).\n"
+        f"Text: {exercise['text']}"
+        f"{_format_previous_attempts(previous_attempts)}\n\n"
+        'Respond with ONLY a JSON object like {"answers": ["not", "very"]} '
+        "with one string per blank, in order, no other text, no markdown."
+    )
+    return _ask_json(text)
+
+
 def _solve_matching(exercise, previous_attempts):
     words = exercise["options"]
     targets = exercise["targets"]
+
+    if exercise.get("target_audio_urls"):
+        return _solve_matching_audio(exercise, previous_attempts)
 
     if exercise["targets_are_images"]:
         content = [
@@ -204,6 +231,34 @@ def _solve_matching(exercise, previous_attempts):
     return {"pairs": {word: int(target) for word, target in result.items()}}
 
 
+def _solve_matching_audio(exercise, previous_attempts):
+    """
+    Los targets son clips de audio (sin texto ni imagen) — es un ejercicio
+    de escucha, no de habla grabada. Usa AUDIO_MODEL (el único de los dos
+    que entiende audio) para "escuchar" cada target y emparejarlo con la
+    frase que mejor le corresponde.
+    """
+    words = exercise["options"]
+    target_audio_urls = exercise["target_audio_urls"]
+    target_count = len(target_audio_urls)
+
+    text = (
+        "You are matching English (B1 level) phrases to spoken audio clips. "
+        f"The targets are given as audio clips below, in order (target 1, target 2, "
+        f"..., target {target_count}). Listen to each clip and match it to the phrase "
+        f"that best completes or explains it.\nPhrases: {words}"
+        f"{_format_previous_attempts(previous_attempts)}\n\n"
+        'Respond with ONLY a JSON object mapping each phrase (exact text) to the '
+        'target number, e.g. {"She lowers the flaps.": 1}, no other text, no markdown.'
+    )
+    content = [{"type": "text", "text": text}]
+    for url in target_audio_urls:
+        content.append({"type": "audio_url", "audio_url": {"url": url}})
+
+    result = _ask_json(content, model=AUDIO_MODEL)
+    return {"pairs": {word: int(target) for word, target in result.items()}}
+
+
 def _solve_ordering(exercise, previous_attempts):
     items = exercise["items"]
     items_text = "\n".join(f"{i}. {item}" for i, item in enumerate(items))
@@ -231,8 +286,10 @@ def solve_exercise(exercise_data: dict, previous_attempts: list | None = None) -
     con forma según su "type":
 
         multiple_choice -> {"type", "prompt", "options": [str, ...]}
-        matching        -> {"type", "targets": [str, ...], "targets_are_images": bool, "options": [str, ...]}
+        matching        -> {"type", "targets": [str, ...], "targets_are_images": bool, "options": [str, ...],
+                            "target_audio_urls": [str, ...] opcional (targets solo-audio)}
         cloze_dropdown  -> {"type", "text", "blanks": [[str, ...], ...]}
+        cloze_input     -> {"type", "text", "blank_count": int}
         ordering        -> {"type", "items": [str, ...]}  (en orden desordenado, a reordenar)
 
     previous_attempts: soluciones ya intentadas para este mismo ejercicio que
@@ -244,6 +301,7 @@ def solve_exercise(exercise_data: dict, previous_attempts: list | None = None) -
 
         multiple_choice -> {"answer": <índice 1-based de la opción>}
         cloze_dropdown  -> {"answers": [<índice 0-based>, ...]}  (uno por blank)
+        cloze_input     -> {"answers": [<str>, ...]}  (texto libre, uno por blank)
         matching        -> {"pairs": {<palabra>: <índice 1-based del target>, ...}}
         ordering        -> {"order": [str, ...]}  (los mismos "items", en el orden correcto)
     """
@@ -258,6 +316,9 @@ def solve_exercise(exercise_data: dict, previous_attempts: list | None = None) -
 
     if exercise_type == "cloze_dropdown":
         return _solve_cloze_dropdown(exercise_data, previous_attempts)
+
+    if exercise_type == "cloze_input":
+        return _solve_cloze_input(exercise_data, previous_attempts)
 
     if exercise_type == "matching":
         return _solve_matching(exercise_data, previous_attempts)

@@ -75,6 +75,18 @@ def get_choice_audio_data_uris(page, count):
     return _capture_audio_from_buttons(page, buttons)
 
 
+def get_matching_target_audio_data_uris(page, count):
+    """
+    Para un ejercicio "matching" cuyos targets son solo audio (sin
+    PromptTitle legible ni imagen) — es un ejercicio de ESCUCHA, no de
+    habla grabada, así que sí se puede resolver de verdad "escuchando"
+    cada target en vez de adivinar parejas al azar.
+    """
+    targets = page.locator('[data-qa="MatchingDropTarget"]')
+    buttons = [targets.nth(i).locator('[data-qa="ListenButton"]') for i in range(count)]
+    return _capture_audio_from_buttons(page, buttons)
+
+
 def get_prompt_audio_data_uri(page):
     """
     Para un ejercicio "multiple_choice" cuya PREGUNTA es solo audio (sin
@@ -222,6 +234,100 @@ def has_speech_modal(page):
     return page.get_by_text("Continuar sin voz", exact=True).count() > 0
 
 
+def get_flagged_activity_ids(page):
+    """
+    Devuelve los IDs (estables, únicos por actividad) de las actividades
+    del panel lateral marcadas "Omitida" o "Vuelva a intentarlo".
+
+    Cada actividad tiene un contenedor `data-qa="activity_<id>"` con un
+    hijo cuyo `data-qa` indica el estado — **ojo, el sufijo varía según el
+    estado** (confirmado en vivo con capturas): `activity_<id>_completed`
+    para "Correcta"/"Completa", pero `activity_<id>_skipped` para
+    "Omitida" (posiblemente otros sufijos para otros estados). Por eso NO
+    hay que buscar por un sufijo fijo — se busca directamente el
+    contenedor (`data-qa="activity_<id>"`, sin más sufijo) y se revisa su
+    texto completo, sin importar qué sufijo tenga el hijo de estado.
+
+    Mientras estás PARADO en una actividad no existe ningún hijo de estado
+    para ella (ni vacío) — por eso no hay forma de saber si un ejercicio
+    ya visto era "Correcta" u "Omitida" mientras lo estás revisitando,
+    solo se sabe una vez que lo pasaste.
+
+    Usar el `<id>` (en vez de posición/índice) para reintentar cada
+    actividad es más robusto que buscar por texto visible: no se ve
+    afectado por cuántas otras actividades se arreglen o descarten en el
+    camino.
+
+    Devuelve el `data-qa` COMPLETO del hijo de estado (ej.
+    "activity_<id>_skipped"), no solo el id — **confirmado en vivo que
+    importa cuál de los dos se clickea**: clickear el CONTENEDOR
+    (`activity_<id>`) para reabrir la actividad no siempre funciona igual
+    que clickear el hijo de estado directamente (con el contenedor, una
+    Demostración "Omitida" a veces se saltaba de nuevo en vez de mostrar
+    el video otra vez; con el hijo de estado sí volvía a mostrar el video
+    interactivo, que es el mismo elemento que ya se había probado y
+    confirmado funcionando antes de tener este helper).
+    """
+    return page.evaluate(
+        """
+        () => {
+            const qas = [];
+            document.querySelectorAll('[data-qa^="activity_"]').forEach((el) => {
+                const qa = el.getAttribute('data-qa');
+                const rest = qa.slice('activity_'.length);
+                if (rest.includes('_')) return; // hijo de estado (_completed, _skipped, ...), no el contenedor
+                const text = el.textContent;
+                if (text.includes('Omitida') || text.includes('Vuelva a intentarlo')) {
+                    // Buscar el hijo real cuyo propio texto es el estado.
+                    const child = Array.from(el.querySelectorAll('[data-qa]')).find(
+                        c => c.textContent.trim() === 'Omitida' || c.textContent.trim() === 'Vuelva a intentarlo'
+                    );
+                    qas.push(child ? child.getAttribute('data-qa') : qa);
+                }
+            });
+            return qas;
+        }
+        """
+    )
+
+
+def click_activity(page, status_qa):
+    """
+    Hace clic en el hijo de estado ("Omitida"/"Vuelva a intentarlo") de una
+    actividad del panel lateral, identificado por su `data-qa` completo
+    (ver get_flagged_activity_ids) — reabre esa actividad de verdad.
+
+    Confirmado en vivo: reabrir una actividad desde el sidebar puede
+    disparar el modal de habla ("Habilitar actividades de habla") de
+    nuevo, incluso si ya se había descartado antes en la misma sesión.
+    Playwright interpreta el modal como un overlay transitorio y reintenta
+    el clic en bucle hasta agotar el timeout (30s) en vez de fallar rápido
+    o detectar que hay que descartarlo primero.
+    """
+    locator = page.locator(f'[data-qa="{status_qa}"]').first
+    try:
+        locator.click(timeout=5000)
+    except Exception:
+        if has_speech_modal(page):
+            dismiss_speech_modal(page)
+        locator.click(force=True)
+
+
+def has_read_aloud_activity(page):
+    """
+    Detecta la pantalla "Lectura en voz alta" (pestañas "Leer"/"Escuchar"/
+    "Hablar"): requiere grabarse leyendo el texto en voz alta, no
+    automatizable. A diferencia del modal inicial de habla (una sola vez
+    por sesión de navegador, ver has_speech_modal), esta pantalla aparece
+    como una actividad más dentro de la lección y no dispara ningún modal
+    — sin esta detección, run_lesson() la trata como "pantalla no
+    reconocida" genérica, lo cual la salta igual de bien pero no dice en
+    el log que es una omisión intencional (de habla) y no un hueco real
+    de mapeo.
+    """
+    return page.get_by_text("Lectura en voz alta", exact=True).count() > 0
+
+
 def has_paginated_content(page):
     """
     Detecta pantallas paginadas (Vocabulario, Explicación) con varios
@@ -250,16 +356,33 @@ def has_video(page):
     return page.locator("video").count() > 0
 
 
-def can_advance(page):
+def video_is_watched(page):
     """
-    True si el botón de avance (SubmitButton, reusado como "Próxima
-    actividad" una vez completa la pantalla) ya está listo para hacer
-    clic. El <video> de una Demostración sigue en el DOM aunque la
-    actividad ya quede marcada completa, así que has_video() por sí solo
-    no basta para saber si falta saltarlo o si ya toca avanzar.
+    True si todos los <video> de la pantalla ya realmente terminaron
+    (evento "ended" del propio navegador). NO usar el atributo "disabled"
+    de [data-qa="SubmitButton"] para esto: ese botón es un <div>, nunca
+    tiene "disabled" de verdad, así que siempre parecía "listo para
+    avanzar" incluso con el video sin ver — eso hacía que skip_video()
+    nunca se llegara a llamar en la práctica y la Demostración quedara
+    "Omitida" en vez de "Completa".
+
+    Antes se aceptaba también "le faltan 3 segundos o menos" como
+    equivalente a terminado (margen de seguridad para no colgarse
+    esperando una igualdad exacta de currentTime===duration a 16x). Pero
+    confirmado en vivo que ese margen deja la Demostración "Omitida" de
+    todas formas: Rosetta exige el final real, no "casi terminado". El
+    evento "ended" del navegador es fiable sin importar la velocidad de
+    reproducción, así que no hace falta ningún margen.
     """
-    button = page.locator('[data-qa="SubmitButton"]')
-    return button.count() > 0 and button.first.get_attribute("disabled") is None
+    return page.evaluate(
+        """
+        () => {
+            const videos = document.querySelectorAll('video');
+            if (videos.length === 0) return false;
+            return Array.from(videos).every((v) => v.ended);
+        }
+        """
+    )
 
 
 def skip_video(page):
@@ -271,7 +394,8 @@ def skip_video(page):
     que los eventos que dispara el propio navegador sean reales y Rosetta
     los cuente igual que si se hubiera visto completo, solo que mucho más
     rápido. Esta función solo arranca la reproducción rápida; quien la
-    llama debe esperar (via can_advance) a que efectivamente termine.
+    llama debe esperar (via video_is_watched) a que efectivamente termine
+    ("ended" real, no "casi terminado" — ver video_is_watched).
     """
     page.evaluate(
         """
@@ -288,12 +412,7 @@ def skip_video(page):
     )
     try:
         page.wait_for_function(
-            """
-            () => {
-                const v = document.querySelector('video');
-                return v && (v.ended || (isFinite(v.duration) && v.duration > 0 && v.currentTime >= v.duration - 3));
-            }
-            """,
+            "() => { const v = document.querySelector('video'); return v && v.ended; }",
             timeout=30000,
         )
     except Exception:
@@ -319,14 +438,14 @@ def get_current_exercise(page):
                             "prompt_audio_url": str|None (si la pregunta es solo audio),
                             "option_audio_urls": [str|None, ...] opcional (opciones solo-audio,
                             "options" queda vacío en ese caso)}
-        matching        -> {"type", "targets": [str, ...], "targets_are_images": bool, "options": [str, ...]}
+        matching        -> {"type", "targets": [str, ...], "targets_are_images": bool, "options": [str, ...],
+                            "target_audio_urls": [str, ...] opcional (targets solo-audio)}
                             (targets son URLs de imagen si targets_are_images, si no son oraciones/frases)
         cloze_dropdown  -> {"type", "text", "blanks": [[str, ...], ...]}
+        cloze_input     -> {"type", "text", "blank_count": int}
+                            (espacios en blanco de texto libre, sin opciones para elegir)
 
-    Confirmado inspeccionando el HTML real de Fluency Builder. La
-    *interacción* (click_option/write_answer) solo está implementada para
-    "multiple_choice" por ahora; "matching" (drag & drop) y "cloze_dropdown"
-    (menús desplegables inline) quedan pendientes.
+    Confirmado inspeccionando el HTML real de Fluency Builder.
     """
     if (
         page.locator('[data-qa="MultipleChoicePromptText"]').count() > 0
@@ -415,19 +534,30 @@ def get_current_exercise(page):
                 "Tipo 'matching' sin palabras arrastrables detectadas (variante no mapeada) no soportado."
             )
 
-        # Targets SOLO de audio (sin imagen ni texto legible): no hay forma
-        # de saber qué palabra va con qué destino, pero target_count sí se
-        # conoce y las palabras sí son arrastrables. "unsolvable" deja que
-        # ai.py arme parejas al azar en vez de omitir la actividad entera:
-        # tras un par de fallos Rosetta suele revelar las parejas
-        # correctas (ver browser.is_answer_revealed) y se avanza igual.
-        unsolvable = not any(target_values)
+        # Targets SOLO de audio (sin imagen ni texto legible): es un
+        # ejercicio de ESCUCHA, no de habla grabada, así que SÍ se puede
+        # resolver de verdad capturando el audio real de cada target (igual
+        # que ya se hace para "multiple_choice" de audio) en vez de
+        # adivinar parejas al azar — confirmado en vivo que la revelación
+        # de Rosetta no da crédito real, así que adivinar no es aceptable
+        # aquí si en realidad se puede "escuchar".
+        target_audio_urls = None
+        if not targets_are_images and not any(target_values):
+            target_audio_urls = get_matching_target_audio_data_uris(page, target_count)
+
+        # "unsolvable" solo si de verdad no hay ninguna señal usable (ni
+        # texto/imagen, ni se pudo capturar el audio de todos los targets):
+        # ahí sí no queda otra que adivinar y confiar en la revelación.
+        unsolvable = not any(target_values) and (
+            target_audio_urls is None or any(url is None for url in target_audio_urls)
+        )
 
         return {
             "type": "matching",
             "targets": target_values,
             "targets_are_images": targets_are_images,
             "options": option_values,
+            "target_audio_urls": target_audio_urls,
             "unsolvable": unsolvable,
         }
 
@@ -437,6 +567,22 @@ def get_current_exercise(page):
             "type": "cloze_dropdown",
             "text": get_cloze_text(page),
             "blanks": get_cloze_options(page, cloze_dropdowns.count()),
+        }
+
+    cloze_inputs = page.locator('[data-qa="ClozeInput"]')
+    if cloze_inputs.count() > 0:
+        # "Llene los espacios en blanco" con texto libre (no hay opciones para
+        # elegir, hay que escribir la palabra/frase exacta). El texto SÍ es
+        # legible por contexto, así que ai.py intenta una respuesta real en
+        # vez de adivinar a ciegas: confirmado en vivo que Rosetta revela la
+        # respuesta y avanza tras solo 2 fallos, pero deja el ejercicio
+        # marcado como incorrecto para siempre (la revelación no da crédito
+        # real, solo evita que el bot se quede trabado) — más vale que la IA
+        # tenga una oportunidad genuina de acertar dentro de esos 2 intentos.
+        return {
+            "type": "cloze_input",
+            "text": get_cloze_input_text(page),
+            "blank_count": cloze_inputs.count(),
         }
 
     if page.locator('[data-qa="DraggableSentenceItem"]').count() > 0:
@@ -494,6 +640,45 @@ def get_cloze_text(page):
         }
         """
     )
+
+
+def get_cloze_input_text(page):
+    """
+    Devuelve el texto de un ejercicio "cloze_input" (espacios en blanco de
+    texto libre) con cada espacio marcado como "___N___" (N = orden en que
+    aparece el <input data-qa="ClozeInput"> en el DOM), igual que
+    get_cloze_text() hace para los dropdowns.
+    """
+    return page.evaluate(
+        """
+        () => {
+            const container = document.querySelector('[data-qa="step_content"]');
+            const clone = container.cloneNode(true);
+            let i = 0;
+            clone.querySelectorAll('[data-qa="ClozeInput"]').forEach((el) => {
+                i += 1;
+                el.replaceWith(document.createTextNode(` ___${i}___ `));
+            });
+            return clone.innerText;
+        }
+        """
+    )
+
+
+def fill_cloze_input(page, blank_index, text):
+    """
+    Escribe texto en el espacio en blanco blank_index (1-based) de un
+    ejercicio "cloze_input" (Llene los espacios en blanco con texto libre).
+
+    El botón de enviar es un <div> (no un <button disabled> real), así que
+    Playwright no espera a que React procese el cambio antes de permitir el
+    siguiente clic. Sin una pequeña espera aquí, bot.py podía hacer clic en
+    "Enviar" justo antes de que el campo quedara realmente registrado como
+    lleno, y el clic caía como no-op silencioso: el texto se veía escrito
+    pero nunca se enviaba (confirmado en vivo por el usuario).
+    """
+    page.locator('[data-qa="ClozeInput"]').nth(blank_index - 1).fill(text)
+    page.wait_for_timeout(300)
 
 
 def get_cloze_options(page, blank_count):
@@ -626,6 +811,27 @@ def get_feedback_state(page):
     if page.locator('[data-qa="IncorrectFeedback"]').count() > 0:
         return "incorrect"
     return None
+
+
+def wait_for_feedback(page, timeout_ms=8000, poll_ms=250):
+    """
+    Sondea hasta que aparezca feedback reconocible (correcto/incorrecto) o
+    Rosetta revele la respuesta, en vez de una espera fija. Confirmado en
+    vivo que "cloze_input" tarda más de 1.5s en mostrar su feedback (a
+    diferencia de multiple_choice/matching, que son casi instantáneos): una
+    espera fija corta hacía que get_feedback_state() devolviera None
+    mientras el envío seguía procesándose, y el reintento de bot.py caía
+    sobre esa vista a medio actualizar (el siguiente fill() ya no
+    encontraba el input, con timeout de 30s).
+    """
+    elapsed = 0
+    while elapsed < timeout_ms:
+        feedback = get_feedback_state(page)
+        if feedback is not None or is_answer_revealed(page):
+            return feedback
+        page.wait_for_timeout(poll_ms)
+        elapsed += poll_ms
+    return get_feedback_state(page)
 
 
 def is_answer_revealed(page):
