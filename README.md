@@ -540,6 +540,9 @@ controles**, así que leerla es trivial.
 | `matching` | cada palabra queda colocada en su destino correcto | `{"pairs": {"<palabra>": <destino>}}` |
 | `ordering` | los ítems quedan reordenados correctamente | `{"order": [...]}` |
 
+Los seis extractores están probados contra el DOM real volcado de su
+propio tipo, no por parecido con otro.
+
 * En `cloze_dropdown` se guarda el **texto** de la opción, no su índice:
   `select_cloze_option()` acepta ambos y el texto no depende del orden del
   menú.
@@ -554,7 +557,7 @@ controles**, así que leerla es trivial.
   una lectura incompleta dejaría el ejercicio mal igual al aplicarla.
 
 * [x] **La ronda de reintentos que APRENDE ya no se desperdicia.** El bucle de `run_lesson()` decidía si valía otra pasada contando los pendientes, y una pasada en la que la IA falla y Rosetta enseña la respuesta **no baja ese contador** (el ejercicio sigue mal) — aunque es la pasada más valiosa, porque deja la respuesta guardada. Cortaba justo ahí y el aprendizaje no se usaba hasta la corrida siguiente. Ahora la condición de corte también mira si se aprendió algo nuevo, así la pasada que aprende y la que aplica ocurren en la MISMA corrida.
-* [x] **Memoria de las respuestas que Rosetta enseña (`known_answers.json`).** Confirmado desde hace tiempo que la revelación NO da crédito: un ejercicio que llega a "Mostrar respuesta" queda mal igual. La única forma de arreglarlo es reabrir la actividad desde el panel lateral — pero ahí la IA volvía a adivinar a ciegas con los mismos dos intentos, así que lo más probable era fallar otra vez. Ahora el ciclo es: (1) ¿hay respuesta guardada de este ejercicio? se aplica directo, sin gastar IA; (2) si no, se le pregunta a la IA; (3) agotados los intentos se pulsa "Mostrar respuesta" **a propósito**, se lee y se guarda, indexada por `browser.get_exercise_key()` (la ruta del ejercicio dentro del curso, estable entre reaperturas); (4) el ejercicio queda mal en esa pasada, pero la siguiente lo responde de memoria; (5) una vez correcto, la respuesta se borra para no acumular basura. Cubre los seis tipos (ver la tabla de arriba). Cada extractor está probado contra el DOM real volcado de su tipo.
+* [x] **Memoria de las respuestas que Rosetta enseña (`known_answers.json`).** Confirmado desde hace tiempo que la revelación NO da crédito: un ejercicio que llega a "Mostrar respuesta" queda mal igual. La única forma de arreglarlo es reabrir la actividad desde el panel lateral — pero ahí la IA volvía a adivinar a ciegas con los mismos dos intentos, así que lo más probable era fallar otra vez. Ahora el ciclo es: (1) ¿hay respuesta guardada de este ejercicio? se aplica directo, sin gastar IA; (2) si no, se le pregunta a la IA; (3) agotados los intentos se pulsa "Mostrar respuesta" **a propósito**, se lee y se guarda, indexada por `browser.get_exercise_key()` (la ruta del ejercicio dentro del curso, estable entre reaperturas); (4) el ejercicio queda mal en esa pasada, pero la siguiente lo responde de memoria; (5) una vez correcto, la respuesta se borra para no acumular basura. Cubre los seis tipos (ver la tabla de arriba), cada uno probado contra el DOM real volcado de su propio tipo.
 
 ### El panel lateral y el resumen (confirmado volcando el DOM real)
 
