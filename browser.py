@@ -1300,12 +1300,24 @@ def select_cloze_option(page, blank_index, option):
     option: índice 0-based de la opción (MenuItem_N) o su texto exacto.
     """
     dropdown = page.locator(f'[data-qa="ClozeDropdown_{blank_index}"]')
-    dropdown.locator('[data-qa="MenuButton"]').click()
+    label = dropdown.locator('[data-qa="MenuButtonLabel"]')
 
-    items = dropdown.locator('[data-qa^="MenuItem_"]')
-    item = items.nth(option) if isinstance(option, int) else items.filter(has_text=option)
-    # Timeout corto: si esa opción no existe, fallar rápido en vez de 30 s.
-    item.first.click(timeout=5000)
+    # Se comprueba que la selección quedó puesta y se reintenta: confirmado
+    # en vivo que un espacio podía quedarse sin elegir (con tres espacios,
+    # uno se quedaba vacío y el botón del pie seguía en "Omitir", así que la
+    # respuesta entera no se podía enviar).
+    for attempt in range(3):
+        dropdown.locator('[data-qa="MenuButton"]').click(timeout=5000)
+        page.wait_for_timeout(200)
+        items = dropdown.locator('[data-qa^="MenuItem_"]')
+        wanted = items.nth(option).inner_text().strip() if isinstance(option, int) else option
+        item = items.nth(option) if isinstance(option, int) else items.filter(has_text=option)
+        # Timeout corto: si esa opción no existe, fallar rápido en vez de 30 s.
+        item.first.click(timeout=5000)
+        page.wait_for_timeout(200)
+        if label.count() == 0 or label.first.inner_text().strip() == wanted:
+            return True
+    return False
 
 
 def drag_matching_pair(page, word, target_index):
