@@ -4,75 +4,117 @@ import time
 import config
 
 
-def _capture_audio_from_buttons(page, listen_buttons):
-    """
-    Hace clic en cada locator de `listen_buttons` (uno por cada botón de
-    escuchar, en orden) y captura el audio real de cada uno como data URI
-    base64. La URL del audio no se puede descargar directamente sin el
-    contexto exacto del navegador (da 500 — y a veces incluso así, de forma
-    transitoria, así que hay reintentos con pausa), y el navegador cachea el
-    audio (un clic repetido no siempre dispara una nueva petición de red que
-    un listener "response" pueda ver) — por eso se usa page.route() para
-    interceptar la petición en sí.
+# Rutas desde las que Rosetta sirve el audio. La primera es la actual;
+# MediumHandler.ashx es la antigua y se conserva por si alguna actividad aún
+# la usa. Confirmado en vivo registrando la red al pulsar un ListenButton:
+# el audio ya NO pasaba por MediumHandler.ashx, así que la captura (que solo
+# interceptaba esa ruta) esperaba 8 s por botón y se rendía SIEMPRE — unos
+# 35 s perdidos por ejercicio, y la IA respondiendo a ciegas.
+_AUDIO_ROUTES = ("**/LotusAssets/data/**", "**/MediumHandler.ashx*")
 
-    Devuelve una lista del mismo largo que `listen_buttons`; una entrada
-    queda None si no se pudo capturar ese audio.
+
+def _audio_mime(data):
+    """Tipo de audio según los primeros bytes (el servidor manda octet-stream)."""
+    if data[:3] == b"ID3" or (len(data) > 1 and data[0] == 0xFF and (data[1] & 0xE0) == 0xE0):
+        return "audio/mpeg"
+    if data[:4] == b"OggS":
+        return "audio/ogg"
+    if data[:4] == b"RIFF":
+        return "audio/wav"
+    if data[4:8] == b"ftyp":
+        return "audio/mp4"
+    return None
+
+
+def _download_audio(page, url):
     """
-    data_uris = [None] * len(listen_buttons)
-    current_index = {"i": None}
+    Descarga el clip entero. El navegador lo pide por trozos (206, rangos),
+    así que no sirve lo que pasa por la red al reproducirlo: se baja aparte.
+    Devuelve (data_uri, None) o (None, motivo).
+    """
+    last_error = None
+    for attempt in range(3):
+        try:
+            response = page.request.get(url, timeout=15000)
+            if response.ok:
+                data = response.body()
+                mime = _audio_mime(data)
+                if mime:
+                    return f"data:{mime};base64,{base64.b64encode(data).decode('utf-8')}", None
+                last_error = f"formato no reconocido ({data[:8]!r})"
+            else:
+                last_error = f"HTTP {response.status}"
+        except Exception as e:
+            last_error = str(e)
+        time.sleep(1)
+    return None, last_error
+
+
+def _capture_audio_from_buttons(page, listen_buttons, with_ids=False):
+    """
+    Pulsa cada ListenButton (en orden) y captura el audio real que carga,
+    como data URI base64.
+
+    Se usa page.route() para ver la petición: además de interceptarla,
+    activar el enrutado desactiva la caché HTTP del navegador, así que cada
+    clic genera su petición aunque ese clip ya se hubiera reproducido antes.
+    La petición solo se usa para saber QUÉ URL es; el archivo se descarga
+    completo aparte (ver _download_audio).
+
+    Devuelve una lista del mismo largo que `listen_buttons` (None donde no
+    se pudo). Con with_ids=True devuelve (data_uris, urls): la URL de cada
+    clip es un hash de su contenido, o sea un identificador ESTABLE de la
+    opción — imprescindible porque Rosetta baraja el orden de las opciones
+    de audio en cada apertura (confirmado en vivo: guardar "la opción 2" no
+    servía al reabrir).
+    """
+    urls = [None] * len(listen_buttons)
+    current = {"i": None}
 
     def handle_route(route):
-        idx = current_index["i"]
-        if idx is not None and "MediumHandler" in route.request.url:
-            last_response = None
-            for attempt in range(5):
-                if attempt > 0:
-                    time.sleep(1)
-                try:
-                    last_response = route.fetch()
-                    content_type = last_response.headers.get("content-type", "")
-                    if content_type.startswith("audio/"):
-                        body = last_response.body()
-                        data_uris[idx] = f"data:{content_type};base64,{base64.b64encode(body).decode('utf-8')}"
-                        route.fulfill(response=last_response)
-                        return
-                except Exception:
-                    pass
-            try:
-                if last_response is not None:
-                    route.fulfill(response=last_response)
-                else:
-                    route.continue_()
-            except Exception:
-                pass
-            return
+        idx = current["i"]
+        if idx is not None and urls[idx] is None:
+            urls[idx] = route.request.url
         route.continue_()
 
-    page.route("**/MediumHandler.ashx*", handle_route)
+    for pattern in _AUDIO_ROUTES:
+        page.route(pattern, handle_route)
     try:
         for i, button in enumerate(listen_buttons):
-            current_index["i"] = i
-            button.click()
-            # Un solo clic: el handler de arriba ya reintenta la petición
-            # internamente si el servidor falla (hasta 5 veces con pausa,
-            # ~5s en el peor caso). Reintentar el CLIC además de eso hacía
-            # que se reprodujera el mismo audio varias veces de más. La
-            # espera activa solo necesita cubrir ese peor caso.
+            current["i"] = i
+            try:
+                button.click(timeout=5000)
+            except Exception as e:
+                print(f"  (no se pudo pulsar el botón de audio {i + 1}: {e})")
+                continue
             waited = 0
-            while data_uris[i] is None and waited < 8000:
-                page.wait_for_timeout(200)
-                waited += 200
+            while urls[i] is None and waited < 5000:
+                page.wait_for_timeout(100)
+                waited += 100
+        current["i"] = None
     finally:
-        page.unroute("**/MediumHandler.ashx*", handle_route)
+        for pattern in _AUDIO_ROUTES:
+            page.unroute(pattern, handle_route)
 
-    return data_uris
+    data_uris = []
+    for i, url in enumerate(urls):
+        if url is None:
+            print(f"  (audio {i + 1}: el botón no pidió ningún clip)")
+            data_uris.append(None)
+            continue
+        data_uri, error = _download_audio(page, url)
+        if error:
+            print(f"  (audio {i + 1}: no se pudo descargar: {error})")
+        data_uris.append(data_uri)
+
+    return (data_uris, urls) if with_ids else data_uris
 
 
-def get_choice_audio_data_uris(page, count):
+def get_choice_audio_data_uris(page, count, with_ids=False):
     """Para un ejercicio "multiple_choice" cuyas opciones son solo audio (sin ChoiceText)."""
     choices = page.locator('[data-qa="ChoiceButton"]')
     buttons = [choices.nth(i).locator('[data-qa="ListenButton"]') for i in range(count)]
-    return _capture_audio_from_buttons(page, buttons)
+    return _capture_audio_from_buttons(page, buttons, with_ids=with_ids)
 
 
 def get_matching_target_audio_data_uris(page, count):
@@ -650,11 +692,13 @@ def get_current_exercise(page, capture_audio=True):
         # no "hay ListenButton". Cuando falta, se extrae el audio real (en
         # vez de rendirse) para que la IA lo escuche.
         if choices.count() > 0 and choices.nth(0).locator('[data-qa="ChoiceText"]').count() == 0:
-            option_audio_urls = (
-                get_choice_audio_data_uris(page, choices.count())
-                if capture_audio
-                else [None] * choices.count()
-            )
+            if capture_audio:
+                option_audio_urls, option_audio_ids = get_choice_audio_data_uris(
+                    page, choices.count(), with_ids=True
+                )
+            else:
+                option_audio_urls = [None] * choices.count()
+                option_audio_ids = [None] * choices.count()
             if any(url is None for url in option_audio_urls):
                 unsolvable = True
             return {
@@ -663,6 +707,11 @@ def get_current_exercise(page, capture_audio=True):
                 "options": [],
                 "option_count": choices.count(),
                 "option_audio_urls": [] if unsolvable else option_audio_urls,
+                # Identificador estable de cada opción (URL del clip, que es
+                # un hash de su contenido): Rosetta baraja estas opciones en
+                # cada apertura, así que su POSICIÓN no sirve para recordar
+                # cuál era la correcta.
+                "option_audio_ids": option_audio_ids,
                 "image_url": image_url,
                 "prompt_audio_url": prompt_audio_url,
                 "unsolvable": unsolvable,
@@ -995,18 +1044,37 @@ def reorder_items(page, target_order):
     orden real en pantalla y decide el siguiente movimiento en base a eso,
     en vez de calcular todos los movimientos por adelantado.
     """
-    max_moves = len(target_order) * len(target_order) + 5
-    for _ in range(max_moves):
-        current = get_ordering_items(page)
-        if current == target_order:
-            return True
-        for i, wanted_text in enumerate(target_order):
-            if current[i] != wanted_text:
-                src_index = current.index(wanted_text)
-                items = page.locator('[data-qa="DraggableSentenceItem"]')
-                _drag_ordering_item(page, items.nth(src_index), items.nth(i), moving_down=src_index < i)
-                break
-    return get_ordering_items(page) == target_order
+    # La lista entera tiene que caber en pantalla: el ratón no puede soltar
+    # en una coordenada fuera de la ventana. Confirmado en vivo midiendo los
+    # ítems: con la ventana de 720 px, el sexto ítem de una lista iba de
+    # y=691 a y=773, así que todo arrastre desde o hacia él fallaba y el orden
+    # nunca se alcanzaba (con 4 ítems sí funcionaba). Se agranda la ventana lo
+    # justo mientras se reordena y luego se restaura.
+    original_viewport = page.viewport_size
+    items = page.locator('[data-qa="DraggableSentenceItem"]')
+    if items.count() > 0 and original_viewport:
+        last = items.nth(items.count() - 1).bounding_box()
+        needed = int(last["y"] + last["height"] + 150) if last else 0
+        if needed > original_viewport["height"]:
+            page.set_viewport_size({"width": original_viewport["width"], "height": needed})
+            page.wait_for_timeout(300)
+
+    try:
+        max_moves = len(target_order) * len(target_order) + 5
+        for _ in range(max_moves):
+            current = get_ordering_items(page)
+            if current == target_order:
+                return True
+            for i, wanted_text in enumerate(target_order):
+                if current[i] != wanted_text:
+                    src_index = current.index(wanted_text)
+                    items = page.locator('[data-qa="DraggableSentenceItem"]')
+                    _drag_ordering_item(page, items.nth(src_index), items.nth(i), moving_down=src_index < i)
+                    break
+        return get_ordering_items(page) == target_order
+    finally:
+        if original_viewport and page.viewport_size != original_viewport:
+            page.set_viewport_size(original_viewport)
 
 
 def write_answer(page, answer):
@@ -1257,7 +1325,15 @@ def get_revealed_answer(page, exercise):
             }
             """
         )
-        return {"answer": index} if index else None
+        if not index:
+            return None
+        solution = {"answer": index}
+        ids = exercise.get("option_audio_ids") or []
+        if len(ids) >= index and ids[index - 1]:
+            # Opciones de solo audio: se barajan al reabrir, así que se
+            # recuerda QUÉ clip era el correcto, no en qué posición estaba.
+            solution["answer_audio_id"] = ids[index - 1]
+        return solution
 
     if kind == "text_input":
         field = page.locator('[data-qa="TextInput"]')

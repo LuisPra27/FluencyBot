@@ -407,8 +407,9 @@ def resolve_current_exercise(page, exercise, max_attempts=MAX_ATTEMPTS):
 
     remembered = _load_known_answers().get(key) if key else None
     if remembered is not None:
-        print(f"Respuesta ya conocida de este ejercicio: {remembered} (sin gastar IA)")
-        apply_solution(page, exercise, remembered)
+        to_apply = _locate_remembered(exercise, remembered)
+        print(f"Respuesta ya conocida de este ejercicio: {to_apply} (sin gastar IA)")
+        apply_solution(page, exercise, to_apply)
         browser.submit_answer(page)
         if browser.wait_for_feedback(page) == "correct":
             browser.go_to_next_exercise(page)
@@ -538,6 +539,26 @@ def resolve_current_exercise(page, exercise, max_attempts=MAX_ATTEMPTS):
             page.wait_for_timeout(1000)
 
     return feedback
+
+
+def _locate_remembered(exercise, remembered):
+    """
+    Adapta una respuesta guardada a cómo está la pantalla AHORA.
+
+    Opción múltiple de solo audio: Rosetta baraja el orden de las opciones
+    en cada apertura, así que la posición guardada ya no sirve. Confirmado
+    en vivo: tres respuestas guardadas seguidas fallaron y cada revelación
+    daba una posición distinta. Se busca en qué posición está hoy el clip
+    que se guardó como correcto.
+    """
+    audio_id = remembered.get("answer_audio_id")
+    ids = exercise.get("option_audio_ids") or []
+    if audio_id and audio_id in ids:
+        now = ids.index(audio_id) + 1
+        if now != remembered.get("answer"):
+            print(f"  (las opciones se barajaron: la correcta pasó de la posición {remembered.get('answer')} a la {now})")
+        return {**remembered, "answer": now}
+    return remembered
 
 
 def _capture_revealed_and_advance(page, exercise, key):
@@ -671,9 +692,12 @@ def _work_single_activity(page, activity):
         # cuando el servidor de audio falla, y se hacía igual justo antes
         # de aplicar una respuesta que ya se sabía.
         key = browser.get_exercise_key(page)
-        already_known = bool(key) and key in _load_known_answers()
+        known = _load_known_answers().get(key) if key else None
+        # Excepción: si lo guardado es un clip de audio (opciones barajadas),
+        # SÍ hay que capturar el audio para saber dónde quedó ese clip hoy.
+        skip_audio = known is not None and "answer_audio_id" not in known
         try:
-            exercise = browser.get_current_exercise(page, capture_audio=not already_known)
+            exercise = browser.get_current_exercise(page, capture_audio=not skip_audio)
         except NotImplementedError:
             # Pantalla no reconocida (ej. Objetivos, o un video ya visto
             # esperando el clic de avance): avanzar igual que hace el
