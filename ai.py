@@ -19,6 +19,8 @@ qué sigue disponible antes de asumir que es un bug del código.
 import json
 import random
 
+from collections import Counter
+
 from openai import OpenAI
 
 import config
@@ -125,6 +127,28 @@ def _blind_guess(exercise_data, previous_attempts):
         items = list(exercise_data["items"])
         random.shuffle(items)
         return {"order": items}
+
+    if exercise_type == "text_rewrite":
+        return {"answers": ["x"] * len(exercise_data["prompts"])}
+
+    if exercise_type == "cloze_drag":
+        words = list(exercise_data["options"])
+        random.shuffle(words)
+        return {"answers": words[:exercise_data["blank_count"]]}
+
+    if exercise_type == "sentence_build":
+        words = list(exercise_data["words"])
+        random.shuffle(words)
+        return {"order": words}
+
+    if exercise_type == "matching_audio_options":
+        ids = list(exercise_data["option_audio_ids"])
+        numbers = list(range(1, len(ids) + 1))
+        random.shuffle(numbers)
+        if all(ids):
+            return {"target_for_clip": dict(zip(ids, numbers))}
+        # Sin identificadores de clip se arrastra por posición (clave "#n").
+        return {"target_for_clip": {f"#{i}": n for i, n in enumerate(numbers)}}
 
     raise NotImplementedError(f"No se sabe adivinar a ciegas el tipo '{exercise_type}'")
 
@@ -365,6 +389,109 @@ def _solve_ordering(exercise, previous_attempts):
     return {"order": [items[i] for i in order_indices]}
 
 
+def _solve_text_rewrite(exercise, previous_attempts):
+    """
+    "Vuelva a escribir el texto según el ejemplo": se le da al modelo el
+    ejemplo ya resuelto por Rosetta, que es lo que dice qué transformación
+    se pide (ej. "I (may/to take) your coat?" -> "May I take your coat?").
+    """
+    n = len(exercise["prompts"])
+    examples = "\n".join(f'  "{e["prompt"]}" -> "{e["value"]}"' for e in exercise["examples"] if e.get("value"))
+    items = "\n".join(f"{i}. {p}" for i, p in enumerate(exercise["prompts"], start=1))
+    text = (
+        "You are solving an English (B1 level) rewriting exercise: rewrite each sentence "
+        "following EXACTLY the same pattern as the solved example.\n"
+        f"Solved example:\n{examples}\n\n"
+        f"Sentences to rewrite:\n{items}\n"
+        f"There are EXACTLY {n} sentences."
+        f"{_format_previous_attempts(previous_attempts)}\n\n"
+        'Respond with ONLY a JSON object like {"answers": ["...", ...]} with EXACTLY '
+        f"{n} rewritten sentences in order, no other text, no markdown."
+    )
+    answers = _ask_json(text)["answers"]
+    if len(answers) != n:
+        raise ValueError(f"se esperaban {n} frases y la IA dio {len(answers)}")
+    return {"answers": answers}
+
+
+def _solve_cloze_drag(exercise, previous_attempts):
+    """
+    Huecos que se rellenan con palabras de un banco común (cada palabra se
+    usa como mucho una vez).
+    """
+    n = exercise["blank_count"]
+    text = (
+        "You are solving an English (B1 level) fill-in-the-blank exercise.\n"
+        "Each blank in the text is marked exactly where it goes as ___N___.\n"
+        f"Text:\n{exercise['text']}\n\n"
+        f"Word bank (use each word at most once): {json.dumps(exercise['options'], ensure_ascii=False)}\n"
+        f"There are EXACTLY {n} blank(s)."
+        f"{_format_previous_attempts(previous_attempts)}\n\n"
+        'Respond with ONLY a JSON object like {"answers": ["word for blank 1", ...]} with EXACTLY '
+        f"{n} strings copied exactly from the word bank, in blank order, no other text, no markdown."
+    )
+    result = _ask_json(text)
+    answers = result["answers"]
+    bank = Counter(exercise["options"])
+    if len(answers) != n or any(Counter(answers)[w] > bank[w] for w in answers):
+        raise ValueError(f"respuesta inválida para {n} hueco(s) con el banco {exercise['options']}: {answers}")
+    return {"answers": answers}
+
+
+def _solve_sentence_build(exercise, previous_attempts):
+    """Ordenar palabras sueltas para formar una oración correcta."""
+    words = exercise["words"]
+    text = (
+        "You are solving an English (B1 level) exercise: arrange ALL of these words "
+        "into one correct, natural English sentence.\n"
+        f"Words (in random order): {json.dumps(words, ensure_ascii=False)}\n"
+        f"Use every word exactly once ({len(words)} words, keep punctuation attached as given)."
+        f"{_format_previous_attempts(previous_attempts)}\n\n"
+        'Respond with ONLY a JSON object like {"order": ["first", "second", ...]} '
+        "with the words copied exactly, no other text, no markdown."
+    )
+    result = _ask_json(text)
+    order = result["order"]
+    if Counter(order) != Counter(words):
+        raise ValueError(f"no usa exactamente las {len(words)} palabras dadas: {order}")
+    return {"order": order}
+
+
+def _solve_matching_audio_options(exercise, previous_attempts):
+    """
+    Correspondencia donde los DESTINOS son texto y lo que se arrastra son
+    clips de audio. Se le da al modelo de audio cada clip numerado y se
+    traduce su respuesta al identificador estable de cada clip.
+    """
+    targets = exercise["targets"]
+    clips = exercise["option_audio_urls"]
+    ids = exercise["option_audio_ids"]
+    targets_text = "\n".join(f"{i}. {t}" for i, t in enumerate(targets, start=1))
+    text = (
+        "You are solving an English (B1 level) matching exercise.\n"
+        f"Below are {len(clips)} audio clips, in order: AUDIO 1 ... AUDIO {len(clips)}.\n"
+        f"And these {len(targets)} numbered texts:\n{targets_text}\n"
+        "Listen to each clip and decide which numbered text it answers or goes with. "
+        "Each text number is used exactly once."
+        f"{_format_previous_attempts(previous_attempts)}\n\n"
+        'Respond with ONLY a JSON object mapping each AUDIO number to a text number, like '
+        '{"1": 3, "2": 1}, no other text, no markdown.'
+    )
+    content = [{"type": "text", "text": text}]
+    for url in clips:
+        content.append({"type": "audio_url", "audio_url": {"url": url}})
+    result = _ask_json(content, model=AUDIO_MODEL)
+    mapping = {}
+    for audio_n, target_n in result.items():
+        a, t = int(audio_n), int(target_n)
+        if not (1 <= a <= len(ids)) or not (1 <= t <= len(targets)):
+            raise ValueError(f"número fuera de rango en {result}")
+        mapping[ids[a - 1]] = t
+    if len(mapping) != len(ids) or len(set(mapping.values())) != len(ids):
+        raise ValueError(f"asignación incompleta o repetida: {result}")
+    return {"target_for_clip": mapping}
+
+
 def solve_exercise(exercise_data: dict, previous_attempts: list | None = None) -> dict:
     """
     exercise_data: dict con el ejercicio extraído por browser.get_current_exercise(),
@@ -423,5 +550,17 @@ def solve_exercise(exercise_data: dict, previous_attempts: list | None = None) -
 
     if exercise_type == "text_input":
         return _solve_text_input(exercise_data, previous_attempts)
+
+    if exercise_type == "text_rewrite":
+        return _solve_text_rewrite(exercise_data, previous_attempts)
+
+    if exercise_type == "cloze_drag":
+        return _solve_cloze_drag(exercise_data, previous_attempts)
+
+    if exercise_type == "sentence_build":
+        return _solve_sentence_build(exercise_data, previous_attempts)
+
+    if exercise_type == "matching_audio_options":
+        return _solve_matching_audio_options(exercise_data, previous_attempts)
 
     raise NotImplementedError(f"ai.solve_exercise no soporta el tipo '{exercise_type}'")

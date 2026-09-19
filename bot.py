@@ -92,6 +92,7 @@ MAX_ACTIVITY_STEPS = 12
 
 BLOCKED_LESSONS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "blocked_lessons.json")
 KNOWN_ANSWERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "known_answers.json")
+SPEECH_ACTIVITIES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "speech_activities.json")
 
 # Motivos por los que no hay que volver a entrar a una lección.
 #   speech    -> lo único pendiente requiere grabar la propia voz.
@@ -218,6 +219,30 @@ def _permanently_blocked_keys(blocked, known_answers=None):
         if state.get("reason") in (BLOCKED_SPEECH, BLOCKED_DONE)
         or (state.get("failures", 0) >= MAX_LESSON_FAILURES and not has_unused_answers(state))
     }
+
+
+def _load_speech_ids():
+    """
+    Ids de actividades cuya pantalla exige hablar aunque su TIPO no lo diga
+    (ej. un "Llene los espacios en blanco" que pide "diga la oración
+    completa"). Sin recordarlas, esas lecciones nunca podían darse por
+    bloqueadas por voz y se reintentaban en cada corrida.
+    """
+    if not os.path.exists(SPEECH_ACTIVITIES_FILE):
+        return set()
+    try:
+        with open(SPEECH_ACTIVITIES_FILE, "r", encoding="utf-8") as f:
+            return set(json.load(f))
+    except (json.JSONDecodeError, OSError):
+        return set()
+
+
+def _remember_speech_activity(activity_id):
+    ids = _load_speech_ids()
+    if activity_id not in ids:
+        ids.add(activity_id)
+        with open(SPEECH_ACTIVITIES_FILE, "w", encoding="utf-8") as f:
+            json.dump(sorted(ids), f, indent=2)
 
 
 def _load_known_answers():
@@ -357,6 +382,25 @@ def apply_solution(page, exercise, solution):
     elif exercise_type == "text_input":
         browser.write_answer(page, solution["answer"])
 
+    elif exercise_type == "text_rewrite":
+        browser.fill_text_rewrite(page, solution["answers"])
+
+    elif exercise_type == "cloze_drag":
+        if not browser.fill_cloze_drag(page, solution["answers"]):
+            print("  (aviso: no se lograron llenar todos los huecos arrastrando)")
+
+    elif exercise_type == "sentence_build":
+        if not browser.build_sentence(page, solution["order"]):
+            print("  (aviso: la oración no quedó exactamente como se pidió)")
+
+    elif exercise_type == "matching_audio_options":
+        ids = exercise.get("option_audio_ids") or []
+        mapping = solution["target_for_clip"]
+        if any(k.startswith("#") for k in mapping):
+            ids = [f"#{i}" for i in range(len(ids))]
+        if not browser.place_matching_audio_options(page, ids, mapping):
+            print("  (aviso: no se lograron colocar todos los clips)")
+
     elif exercise_type == "matching":
         for word, target_index in solution["pairs"].items():
             browser.drag_matching_pair(page, word, target_index)
@@ -478,6 +522,14 @@ def resolve_current_exercise(page, exercise, max_attempts=MAX_ATTEMPTS):
         url_before = page.url
         apply_solution(page, exercise, solution)
         label_before = browser.get_action_button_label(page)
+        if label_before == "Omitir":
+            # Si tras aplicar la respuesta el botón sigue diciendo "Omitir",
+            # la respuesta NO quedó puesta (ej. un hueco sin rellenar al
+            # arrastrar). Pulsarlo no enviaría nada: SALTARÍA la actividad
+            # entera, dejándola "Omitida" (confirmado en vivo). Mejor no
+            # tocarlo y que la pasada siguiente lo reintente.
+            print("  (la respuesta no quedó completa en pantalla; NO pulso 'Omitir' para no saltar la actividad)")
+            return "incorrect"
         browser.submit_answer(page)
 
         feedback = browser.wait_for_feedback(page)
@@ -604,6 +656,7 @@ def _wait_for_activity_screen(page, timeout_ms=8000, poll_ms=500):
     while elapsed < timeout_ms:
         if (
             browser.has_speech_modal(page)
+            or browser.requires_speech(page)
             or browser.has_read_aloud_activity(page)
             or browser.has_video(page)
             or browser.has_paginated_content(page)
@@ -658,6 +711,12 @@ def _work_single_activity(page, activity):
             page.wait_for_timeout(500)
             continue
 
+        if browser.requires_speech(page):
+            _remember_speech_activity(activity["id"])
+            print(f"  '{activity['type']}': la pantalla exige hablar (botón de micrófono); se omite a propósito.")
+            _click_advance(page)
+            return solved_any
+
         if browser.has_read_aloud_activity(page):
             # Requiere grabarse leyendo: es lo único que se acepta omitir.
             print(f"  '{activity['type']}': es lectura en voz alta (requiere grabarse); se omite a propósito.")
@@ -705,8 +764,16 @@ def _work_single_activity(page, activity):
             _click_advance(page)
             return solved_any
         else:
-            if resolve_current_exercise(page, exercise) == "correct":
+            url_before = page.url
+            outcome = resolve_current_exercise(page, exercise)
+            if outcome == "correct":
                 solved_any = True
+            elif page.url == url_before and outcome != "revealed":
+                # No avanzó y no aprendió nada: insistir aquí repetiría lo
+                # mismo (confirmado en vivo: la misma pantalla se reintentó
+                # 12 veces seguidas gastando una llamada a la IA cada vez).
+                # La siguiente pasada la volverá a intentar desde cero.
+                return solved_any
             # Actividad de varios pasos ("1 de 4 pasos"): seguir mientras
             # la URL diga que seguimos en la misma. Si cambió de actividad
             # (o ya no estamos dentro de una), esta ya quedó terminada.
@@ -768,7 +835,8 @@ def work_pending_activities(page, lesson_title):
     el resumen (ver run_lesson).
     """
     pending = browser.get_pending_activities(page)
-    workable = [a for a in pending if a["type"] not in browser.SPEECH_ACTIVITY_TYPES]
+    speech_ids = _load_speech_ids()
+    workable = [a for a in pending if not browser.is_speech_activity(a, speech_ids)]
     speech = len(pending) - len(workable)
 
     if not workable:
@@ -803,7 +871,8 @@ def work_pending_activities(page, lesson_title):
             continue
 
         if not _wait_for_activity_screen(page):
-            print(f"  '{activity['type']}' no llegó a mostrar nada con lo que trabajar; sigo con la siguiente.")
+            print(f"  '{activity['type']}' no llegó a mostrar nada con lo que trabajar ({page.url.split('/course/')[-1]}); sigo con la siguiente.")
+            _debug_screenshot_omit(page, activity["type"])
             continue
 
         # Un error en UNA actividad no debe costar la lección entera.
@@ -901,6 +970,19 @@ def run_lesson(page, lesson_title, already_completed=0, max_skips=MAX_SKIPS):
         # solo-audio intercepta peticiones reales de red y es lo más lento
         # de get_current_exercise(). Bajarlo para tirarlo era tiempo puro
         # perdido en cada "Reanudar", que siempre reinicia desde el paso 1.
+        # Pantalla que exige hablar (botón de micrófono), aunque su tipo no
+        # lo diga: se omite a propósito, igual que la lectura en voz alta.
+        if browser.requires_speech(page):
+            skips += 1
+            if skips > max_skips:
+                break
+            print(f"'{lesson_title}': pantalla que exige hablar; la omito a propósito...")
+            skip_button = page.locator('[data-qa="SubmitButton"], [data-qa="StartLessonButton"]')
+            if skip_button.count() > 0:
+                skip_button.first.click()
+                page.wait_for_timeout(1500)
+            continue
+
         try:
             exercise = browser.get_current_exercise(page, capture_audio=solved >= already_completed)
         except NotImplementedError:
@@ -1080,7 +1162,8 @@ def run_lesson(page, lesson_title, already_completed=0, max_skips=MAX_SKIPS):
             break
 
         pending = browser.get_pending_activities(page)
-        workable = [a for a in pending if a["type"] not in browser.SPEECH_ACTIVITY_TYPES]
+        speech_ids = _load_speech_ids()
+        workable = [a for a in pending if not browser.is_speech_activity(a, speech_ids)]
         if not workable:
             break
         if previous_pending is not None and len(workable) >= previous_pending and not learned:
@@ -1116,9 +1199,10 @@ def run_lesson(page, lesson_title, already_completed=0, max_skips=MAX_SKIPS):
         return "completed", pending
 
     detail = ", ".join(f"{a['type']} ({a['status'] or 'sin empezar'})" for a in pending)
-    not_speech = [a for a in pending if a["type"] not in browser.SPEECH_ACTIVITY_TYPES]
+    speech_ids = _load_speech_ids()
+    not_speech = [a for a in pending if not browser.is_speech_activity(a, speech_ids)]
     not_speech_detail = ", ".join(f"{a['type']} ({a['status'] or 'sin empezar'})" for a in not_speech)
-    if browser.all_pending_are_speech(pending):
+    if browser.all_pending_are_speech(pending, speech_ids):
         print(
             f"Lección '{lesson_title}': lo único pendiente requiere grabar tu voz [{detail}]. "
             "La marco como bloqueada de verdad y sigo."

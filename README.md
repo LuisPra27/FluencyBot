@@ -229,6 +229,7 @@ FluencyBot/
 ├── .gitignore
 ├── blocked_lessons.json   # generado por el bot: {"curso::lección": {reason, failures, pending}}
 ├── known_answers.json     # generado por el bot: respuestas que Rosetta enseñó, por ejercicio
+├── speech_activities.json # generado por el bot: actividades cuya pantalla exige hablar
 ├── logs/                  # generado por el bot: un bot_<fecha>_<hora>.log por corrida
 └── README.md
 ```
@@ -519,6 +520,24 @@ locator.click()
 * [x] **Un error en UNA actividad tiraba la lección entera**, y tras un timeout la recuperación iba a "Mis cursos" desde dentro de la lección (ese enlace ahí no existe) y provocaba la caída siguiente. Ahora el error se queda en la actividad y se sale de la lección antes de navegar.
 * [x] **Cada omisión deja su motivo en el log**; antes había ramas que avanzaban sin resolver en silencio.
 * [x] La IA daba 2 respuestas para 1 hueco y permutaciones de 5 para 6 ítems; ahora el prompt le da el número exacto y el bot solo rellena los huecos que existen.
+
+### Tipos de ejercicio del curso "Talking with Clients" (mapeados en vivo)
+
+Ninguno se reconocía y todas sus actividades quedaban "Omitida" para siempre.
+
+| tipo | cómo se ve | cómo se responde | revelación |
+| --- | --- | --- | --- |
+| `cloze_drag` | huecos `ClozeDropTarget` + banco de palabras `DragDropText` | **arrastrando** cada palabra a su hueco (un clic no hace nada) | cada hueco queda con su palabra |
+| `sentence_build` | palabras sueltas `SBDItem` + zona `TopDropArea` | **un clic** en cada palabra la añade al final de la oración | la oración correcta queda arriba |
+| `matching_audio_options` | destinos con texto + clips `DragDropAudio` para arrastrar | arrastrando cada clip; el modelo de audio decide las parejas | cada destino queda con su clip (se identifica escuchándolo) |
+| `text_rewrite` | ejemplo resuelto + varios `<textarea>` sin `data-qa` en `inputContainer` | una frase por campo, siguiendo el patrón del ejemplo | los campos quedan con la respuesta |
+
+* **Con un hueco vacío el botón sigue diciendo "Omitir", y pulsarlo SALTA la actividad** (confirmado en vivo). Por eso `resolve_current_exercise()` nunca pulsa el botón si tras aplicar la respuesta sigue en "Omitir": significa que la respuesta no quedó puesta. Comprobado que en opción múltiple el botón sí pasa a "Revisar respuesta" al elegir, así que la regla vale para todos los tipos.
+* **Actividades de voz con nombre de tipo engañoso.** "Llene los espacios en blanco" puede ser "Seleccione la mejor respuesta y diga la oración completa", y "Prácticas de conversación" es igual: tienen botón de micrófono (`SpeechButton`) y, tras elegir una opción, el botón sigue en "Omitir" — no se puede enviar sin hablar. `browser.requires_speech()` las reconoce por el micrófono y sus ids se guardan en `speech_activities.json`, para que la lección pueda darse por bloqueada por voz aunque el tipo no lo diga.
+* Si un ejercicio no avanza y no se aprendió nada, no se insiste en la misma pasada: antes se reintentó 12 veces seguidas la misma pantalla, gastando una llamada a la IA cada vez.
+* `browser.fit_exercise_in_viewport()`: cualquier arrastre necesita que todo el ejercicio quepa en pantalla; con 720 px el tercer hueco de un `cloze_drag` quedaba fuera, igual que el sexto ítem de un `ordering`.
+
+Verificado en vivo: "The Welcome Desk" pasó de no reconocer ninguna actividad a quedar resuelta salvo la voz en 58 s, y "Preparing for an Interview, Part II" al 100% (`matching_audio_options` correcto al primer intento).
 
 ### El botón del pie y la revelación de la respuesta
 

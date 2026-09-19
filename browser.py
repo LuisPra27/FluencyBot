@@ -304,6 +304,11 @@ def has_speech_modal(page):
 # blocked_lessons.json de falsos positivos.
 SPEECH_ACTIVITY_TYPES = {
     "Lectura en voz alta",
+    # Confirmado en vivo: su pantalla pide "Practique sus habilidades de
+    # conversación al decir sus respuestas", tiene botón de micrófono, y al
+    # elegir una opción el botón del pie sigue en "Omitir" (no se puede
+    # enviar sin hablar).
+    "Prácticas de conversación",
     "Pronunciación",
     "Hablar",
     "Habla",
@@ -388,14 +393,41 @@ def get_pending_activities(page):
     ]
 
 
-def all_pending_are_speech(pending):
+def all_pending_are_speech(pending, speech_ids=()):
     """
     True si todo lo que queda pendiente requiere grabar la propia voz, es
     decir: la lección está genuinamente bloqueada y no tiene sentido
     volver a intentarla en futuras corridas. Una lista vacía NO cuenta
     como bloqueada (no queda nada pendiente, que es otra cosa).
     """
-    return bool(pending) and all(a["type"] in SPEECH_ACTIVITY_TYPES for a in pending)
+    return bool(pending) and all(is_speech_activity(a, speech_ids) for a in pending)
+
+
+def is_speech_activity(activity, speech_ids=()):
+    """
+    Una actividad es de voz si su TIPO lo es, o si ya se vio que su pantalla
+    exige hablar (`speech_ids`, ver requires_speech). Lo segundo hace falta
+    porque hay actividades de voz con nombre de tipo engañoso: confirmado en
+    vivo, "Llene los espacios en blanco" puede ser "Seleccione la mejor
+    respuesta y diga la oración completa", que no se puede enviar sin hablar.
+    """
+    return activity["type"] in SPEECH_ACTIVITY_TYPES or activity["id"] in speech_ids
+
+
+def requires_speech(page):
+    """
+    True si la pantalla actual exige hablar: tiene el botón de micrófono
+    (`data-qa="SpeechButton"`) fuera del panel lateral. Confirmado en vivo
+    en tres pantallas distintas ("diga la oración completa", "Prácticas de
+    conversación"): tras elegir una opción, el botón del pie sigue diciendo
+    "Omitir" — Rosetta no deja enviar sin grabar la voz.
+    """
+    return page.evaluate(
+        """
+        () => Array.from(document.querySelectorAll('[data-qa="SpeechButton"], [data-qa="MicIcon"]'))
+            .some((el) => !el.closest('[data-qa="ActivityMapList"]'))
+        """
+    )
 
 
 def go_to_lesson_summary(page):
@@ -623,6 +655,200 @@ def dismiss_speech_modal(page):
     page.wait_for_timeout(1500)
 
 
+def _drag_to(page, source, target):
+    """Arrastre genérico con ratón: pequeño movimiento inicial (umbral de la
+    librería de arrastre) y suelta en el centro del destino."""
+    a, b = source.bounding_box(), target.bounding_box()
+    page.mouse.move(a["x"] + a["width"] / 2, a["y"] + a["height"] / 2)
+    page.mouse.down()
+    page.mouse.move(a["x"] + a["width"] / 2 + 5, a["y"] + a["height"] / 2 + 5, steps=3)
+    page.mouse.move(b["x"] + b["width"] / 2, b["y"] + b["height"] / 2, steps=15)
+    page.wait_for_timeout(150)
+    page.mouse.up()
+    page.wait_for_timeout(500)
+
+
+# --- cloze_drag: huecos que se rellenan ARRASTRANDO palabras de un banco ---
+
+def get_cloze_drag_text(page):
+    """Texto de un 'cloze_drag' con cada hueco marcado como ___N___."""
+    return page.evaluate(
+        """
+        () => {
+            const clone = document.querySelector('[data-qa="step_content"]').cloneNode(true);
+            const bank = clone.querySelector('[data-qa="ClozeDragAndDropBottomArea"]');
+            if (bank) bank.remove();
+            let i = 0;
+            clone.querySelectorAll('[data-qa="ClozeDropTarget"]').forEach((el) => {
+                i += 1;
+                el.replaceWith(document.createTextNode(` ___${i}___ `));
+            });
+            return clone.innerText.trim();
+        }
+        """
+    )
+
+
+def get_cloze_drag_state(page):
+    """(palabra en cada hueco, palabras que quedan en el banco)."""
+    return page.evaluate(
+        """
+        () => [
+            Array.from(document.querySelectorAll('[data-qa="ClozeDropTarget"]')).map(t => t.innerText.trim()),
+            Array.from(document.querySelectorAll('[data-qa="ClozeDragAndDropBottomArea"] [data-qa="DragDropText"]'))
+                .map(w => w.innerText.trim()),
+        ]
+        """
+    )
+
+
+def fill_cloze_drag(page, answers):
+    """
+    Arrastra cada palabra de `answers` a su hueco, en orden. Confirmado en
+    vivo: un clic en la palabra NO hace nada, hay que arrastrarla. Tras cada
+    arrastre se comprueba que la palabra quedó en su sitio y se reintenta
+    si no. Devuelve True si todos los huecos quedaron llenos.
+
+    Importante: con algún hueco vacío el botón del pie sigue diciendo
+    "Omitir", y pulsarlo SALTA la actividad entera (confirmado en vivo).
+    """
+    original = fit_exercise_in_viewport(page)
+    try:
+        targets = page.locator('[data-qa="ClozeDropTarget"]')
+        for i, word in enumerate(answers[:targets.count()]):
+            for _ in range(3):
+                placed, bank = get_cloze_drag_state(page)
+                if placed[i] == word or word not in bank:
+                    break
+                source = page.locator('[data-qa="ClozeDragAndDropBottomArea"] [data-qa="DragDropText"]').nth(bank.index(word))
+                _drag_to(page, source, targets.nth(i))
+        placed, _ = get_cloze_drag_state(page)
+        return all(placed)
+    finally:
+        restore_viewport(page, original)
+
+
+# --- sentence_build: palabras sueltas que se ordenan para formar una oración ---
+
+def get_sentence_build_state(page):
+    """(palabras ya colocadas en la oración, palabras todavía sueltas)."""
+    return page.evaluate(
+        """
+        () => {
+            const items = Array.from(document.querySelectorAll('[data-qa="SBDItem"]'));
+            const text = (el) => (el.querySelector('[data-qa="SBDItemText"]') || el).innerText.trim();
+            return [
+                items.filter(e => e.closest('[data-qa="TopDropArea"]')).map(text),
+                items.filter(e => !e.closest('[data-qa="TopDropArea"]')).map(text),
+            ];
+        }
+        """
+    )
+
+
+def build_sentence(page, words):
+    """
+    Forma la oración pulsando las palabras en orden. Confirmado en vivo: un
+    CLIC en una palabra suelta la añade al final de la oración, sin
+    necesidad de arrastrar. Con palabras repetidas ("a", "the") se pulsa la
+    primera que siga suelta. Devuelve True si la oración quedó exactamente
+    como se pidió.
+    """
+    for word in words:
+        items = page.locator('[data-qa="SBDItem"]')
+        target = None
+        for i in range(items.count()):
+            item = items.nth(i)
+            if item.evaluate("e => !!e.closest('[data-qa=\"TopDropArea\"]')"):
+                continue
+            if item.inner_text().strip() == word:
+                target = item.element_handle()
+                break
+        if target is None:
+            break
+        target.click(timeout=5000)
+        page.wait_for_timeout(250)
+    placed, _ = get_sentence_build_state(page)
+    return placed == list(words)
+
+
+# --- matching con OPCIONES de audio (lo que se arrastra son clips) ---
+
+def get_matching_audio_option_ids(page):
+    """Captura el audio de cada clip que queda abajo (DragDropAudio)."""
+    options = page.locator('[data-qa="MatchingBottomArea"] [data-qa="DragDropAudio"]')
+    buttons = [options.nth(i).locator('[data-qa="ListenButton"]') for i in range(options.count())]
+    return _capture_audio_from_buttons(page, buttons, with_ids=True)
+
+
+def place_matching_audio_options(page, clip_ids, target_for_clip):
+    """
+    Arrastra cada clip a su destino. `clip_ids` son los clips del banco en
+    el orden en que estaban al detectar el ejercicio; `target_for_clip`
+    mapea clip -> destino (1-based). El banco se va vaciando a medida que se
+    arrastra, así que se lleva la cuenta de qué clips quedan y en qué orden.
+    Devuelve True si todos los destinos quedaron con un clip.
+    """
+    original = fit_exercise_in_viewport(page)
+    try:
+        remaining = list(clip_ids)
+        targets = page.locator('[data-qa="MatchingDropTarget"]')
+        for clip, target in sorted(target_for_clip.items(), key=lambda kv: kv[1]):
+            if clip not in remaining:
+                continue
+            idx = remaining.index(clip)
+            bank = page.locator('[data-qa="MatchingBottomArea"] [data-qa="DragDropAudio"]')
+            before = bank.count()
+            _drag_to(page, bank.nth(idx), targets.nth(target - 1))
+            if page.locator('[data-qa="MatchingBottomArea"] [data-qa="DragDropAudio"]').count() < before:
+                remaining.pop(idx)
+        return page.locator('[data-qa="MatchingBottomArea"] [data-qa="DragDropAudio"]').count() == 0
+    finally:
+        restore_viewport(page, original)
+
+
+# --- text_rewrite: "Vuelva a escribir el texto según el ejemplo" ---
+
+def get_text_rewrite(page):
+    """
+    Varias frases en la misma pantalla, cada una con su propio <textarea>
+    (sin data-qa), dentro de `data-qa="inputContainer"`. Antes va un ejemplo
+    ya resuelto (su textarea está deshabilitado y trae la respuesta), que es
+    la clave para saber qué transformación se pide. Confirmado en vivo.
+    """
+    data = page.evaluate(
+        """
+        () => {
+            const root = document.querySelector('[data-qa="step_content"]');
+            const container = root.querySelector('[data-qa="inputContainer"]');
+            const pair = (ta) => {
+                const box = ta.parentElement;
+                const prompt = box ? Array.from(box.children).filter(c => c !== ta).map(c => c.innerText.trim()).join(' ') : '';
+                return {prompt, value: ta.value};
+            };
+            const examples = Array.from(root.querySelectorAll('textarea'))
+                .filter(ta => !container.contains(ta)).map(pair);
+            const items = Array.from(container.querySelectorAll('textarea')).map(pair);
+            return {examples, items};
+        }
+        """
+    )
+    instructions = page.locator('[data-qa="Instructions"]')
+    return {
+        "type": "text_rewrite",
+        "instructions": instructions.first.inner_text().strip() if instructions.count() else "",
+        "examples": data["examples"],
+        "prompts": [item["prompt"] for item in data["items"]],
+    }
+
+
+def fill_text_rewrite(page, answers):
+    fields = page.locator('[data-qa="inputContainer"] textarea')
+    for i, text in enumerate(answers[:fields.count()]):
+        fields.nth(i).fill(text, timeout=5000)
+    page.wait_for_timeout(300)
+
+
 def get_current_exercise(page, capture_audio=True):
     """
     Detecta el ejercicio mostrado actualmente y devuelve un dict consumible
@@ -653,6 +879,40 @@ def get_current_exercise(page, capture_audio=True):
     marcado "unsolvable" porque sin ese audio de verdad no se puede
     resolver: NO uses el resultado para intentar responder.
     """
+    # Tres tipos encontrados en vivo en "Talking with Clients, Customers,
+    # and Partners (B1)" que el bot no reconocía y dejaba "Omitida" para
+    # siempre. Van primero porque sus selectores son exclusivos.
+    if page.locator('[data-qa="ClozeDropTarget"]').count() > 0:
+        _, bank = get_cloze_drag_state(page)
+        return {
+            "type": "cloze_drag",
+            "text": get_cloze_drag_text(page),
+            "blank_count": page.locator('[data-qa="ClozeDropTarget"]').count(),
+            "options": bank,
+        }
+
+    if page.locator('[data-qa="inputContainer"] textarea').count() > 0:
+        return get_text_rewrite(page)
+
+    if page.locator('[data-qa="SBDItem"]').count() > 0:
+        placed, loose = get_sentence_build_state(page)
+        return {"type": "sentence_build", "words": placed + loose}
+
+    if page.locator('[data-qa="MatchingBottomArea"] [data-qa="DragDropAudio"]').count() > 0:
+        targets = page.locator('[data-qa="MatchingDropTarget"] [data-qa="PromptTitle"]')
+        count = page.locator('[data-qa="MatchingBottomArea"] [data-qa="DragDropAudio"]').count()
+        if capture_audio:
+            clips, clip_ids = get_matching_audio_option_ids(page)
+        else:
+            clips, clip_ids = [None] * count, [None] * count
+        return {
+            "type": "matching_audio_options",
+            "targets": [targets.nth(i).inner_text().strip() for i in range(targets.count())],
+            "option_audio_urls": clips,
+            "option_audio_ids": clip_ids,
+            "unsolvable": any(c is None for c in clips),
+        }
+
     if (
         page.locator('[data-qa="MultipleChoicePromptText"]').count() > 0
         or page.locator('[data-qa="MultipleChoicePromptAudio"]').count() > 0
@@ -1033,6 +1293,46 @@ def _drag_ordering_item(page, source_locator, target_locator, moving_down):
     page.wait_for_timeout(400)
 
 
+def fit_exercise_in_viewport(page):
+    """
+    Agranda la ventana lo justo para que TODO el ejercicio quepa en
+    pantalla, y devuelve el tamaño original para restaurarlo después (ver
+    restore_viewport).
+
+    Imprescindible para cualquier arrastre: el ratón no puede soltar en una
+    coordenada fuera de la ventana. Confirmado en vivo dos veces con la
+    ventana de 720 px: el sexto ítem de un 'ordering' iba de y=691 a y=773,
+    y el tercer hueco de un 'cloze_drag' de y=705 a y=742 — ningún arrastre
+    llegaba a ellos y el ejercicio nunca quedaba completo.
+    """
+    original = page.viewport_size
+    if not original:
+        return None
+    bottom = page.evaluate(
+        """
+        () => {
+            let max = 0;
+            const root = document.querySelector('[data-qa="step_content"]') || document.body;
+            root.querySelectorAll('*').forEach((el) => {
+                const r = el.getBoundingClientRect();
+                if (r.height > 0) max = Math.max(max, r.bottom + window.scrollY);
+            });
+            return Math.ceil(max);
+        }
+        """
+    )
+    needed = bottom + 150
+    if needed > original["height"]:
+        page.set_viewport_size({"width": original["width"], "height": needed})
+        page.wait_for_timeout(300)
+    return original
+
+
+def restore_viewport(page, original):
+    if original and page.viewport_size != original:
+        page.set_viewport_size(original)
+
+
 def reorder_items(page, target_order):
     """
     Arrastra los DraggableSentenceItem de un ejercicio 'ordering' hasta
@@ -1045,21 +1345,7 @@ def reorder_items(page, target_order):
     orden real en pantalla y decide el siguiente movimiento en base a eso,
     en vez de calcular todos los movimientos por adelantado.
     """
-    # La lista entera tiene que caber en pantalla: el ratón no puede soltar
-    # en una coordenada fuera de la ventana. Confirmado en vivo midiendo los
-    # ítems: con la ventana de 720 px, el sexto ítem de una lista iba de
-    # y=691 a y=773, así que todo arrastre desde o hacia él fallaba y el orden
-    # nunca se alcanzaba (con 4 ítems sí funcionaba). Se agranda la ventana lo
-    # justo mientras se reordena y luego se restaura.
-    original_viewport = page.viewport_size
-    items = page.locator('[data-qa="DraggableSentenceItem"]')
-    if items.count() > 0 and original_viewport:
-        last = items.nth(items.count() - 1).bounding_box()
-        needed = int(last["y"] + last["height"] + 150) if last else 0
-        if needed > original_viewport["height"]:
-            page.set_viewport_size({"width": original_viewport["width"], "height": needed})
-            page.wait_for_timeout(300)
-
+    original_viewport = fit_exercise_in_viewport(page)
     try:
         max_moves = len(target_order) * len(target_order) + 5
         for _ in range(max_moves):
@@ -1074,8 +1360,7 @@ def reorder_items(page, target_order):
                     break
         return get_ordering_items(page) == target_order
     finally:
-        if original_viewport and page.viewport_size != original_viewport:
-            page.set_viewport_size(original_viewport)
+        restore_viewport(page, original_viewport)
 
 
 def write_answer(page, answer):
@@ -1386,6 +1671,29 @@ def get_revealed_answer(page, exercise):
     if kind == "ordering":
         items = get_ordering_items(page)
         return {"order": items} if items else None
+
+    if kind == "text_rewrite":
+        fields = page.locator('[data-qa="inputContainer"] textarea')
+        values = [fields.nth(i).input_value().strip() for i in range(fields.count())]
+        return {"answers": values} if values and all(values) else None
+
+    if kind == "cloze_drag":
+        placed, _ = get_cloze_drag_state(page)
+        return {"answers": placed} if placed and all(placed) else None
+
+    if kind == "sentence_build":
+        placed, loose = get_sentence_build_state(page)
+        return {"order": placed} if placed and not loose else None
+
+    if kind == "matching_audio_options":
+        # Qué clip quedó en cada destino: hay que pulsar su botón de
+        # escuchar para saber cuál es (los clips no tienen texto).
+        targets = page.locator('[data-qa="MatchingDropTarget"]')
+        buttons = [targets.nth(i).locator('[data-qa="ListenButton"]').last for i in range(targets.count())]
+        _, ids = _capture_audio_from_buttons(page, buttons, with_ids=True)
+        if not ids or any(i is None for i in ids):
+            return None
+        return {"target_for_clip": {clip: n for n, clip in enumerate(ids, start=1)}}
 
     return None
 
