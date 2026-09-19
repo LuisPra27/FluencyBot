@@ -657,6 +657,7 @@ def _wait_for_activity_screen(page, timeout_ms=8000, poll_ms=500):
         if (
             browser.has_speech_modal(page)
             or browser.requires_speech(page)
+            or browser.has_document(page)
             or browser.has_read_aloud_activity(page)
             or browser.has_video(page)
             or browser.has_paginated_content(page)
@@ -738,6 +739,14 @@ def _work_single_activity(page, activity):
                 browser.dismiss_speech_modal(page)
                 page.wait_for_timeout(500)
             print(f"  '{activity['type']}': video visto hasta el final; avanzo.")
+            _click_advance(page)
+            return solved_any
+
+        if browser.has_document(page):
+            if browser.read_document(page):
+                print(f"  '{activity['type']}': documento leído hasta el final; avanzo.")
+            else:
+                print(f"  '{activity['type']}': el botón nunca dejó de decir 'Omitir' tras desplazar el documento.")
             _click_advance(page)
             return solved_any
 
@@ -970,6 +979,17 @@ def run_lesson(page, lesson_title, already_completed=0, max_skips=MAX_SKIPS):
         # solo-audio intercepta peticiones reales de red y es lo más lento
         # de get_current_exercise(). Bajarlo para tirarlo era tiempo puro
         # perdido en cada "Reanudar", que siempre reinicia desde el paso 1.
+        # "Documento": hay que desplazarlo hasta el final para que el botón
+        # deje de decir "Omitir"; si no, queda "Omitida".
+        if browser.has_document(page):
+            browser.read_document(page)
+            print(f"'{lesson_title}': documento leído hasta el final; avanzo...")
+            skip_button = page.locator('[data-qa="SubmitButton"]')
+            if skip_button.count() > 0:
+                skip_button.first.click()
+                page.wait_for_timeout(1500)
+            continue
+
         # Pantalla que exige hablar (botón de micrófono), aunque su tipo no
         # lo diga: se omite a propósito, igual que la lectura en voz alta.
         if browser.requires_speech(page):

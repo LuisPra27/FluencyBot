@@ -554,6 +554,43 @@ def has_read_aloud_activity(page):
     )
 
 
+def has_document(page):
+    """
+    Pantalla "Documento" ("Lea el documento y complete la lección"): una
+    imagen de un documento (un correo, un currículum...) en
+    `data-qa="PageImageContainer"`, dentro de una zona con su propia barra
+    de desplazamiento.
+    """
+    return page.locator('[data-qa="PageImageContainer"]').count() > 0
+
+
+def read_document(page, timeout_ms=5000):
+    """
+    Marca un "Documento" como leído. Confirmado en vivo: el botón del pie
+    dice "Omitir" hasta que el documento se desplaza hasta el FINAL; en ese
+    momento pasa a "Próxima actividad", y pulsarlo lo deja "Completa". Si se
+    pulsaba "Omitir" (o no se hacía nada, como antes), quedaba "Omitida".
+    Devuelve True si el botón llegó a ofrecer avanzar.
+    """
+    elapsed = 0
+    while elapsed < timeout_ms:
+        page.evaluate(
+            """
+            () => {
+                const root = document.querySelector('[data-qa="step_content"]') || document.body;
+                [root, ...root.querySelectorAll('*')].forEach((el) => {
+                    if (el.scrollHeight > el.clientHeight + 5) el.scrollTop = el.scrollHeight;
+                });
+            }
+            """
+        )
+        if get_action_button_label(page) not in (None, "Omitir"):
+            return True
+        page.wait_for_timeout(300)
+        elapsed += 300
+    return False
+
+
 def has_paginated_content(page):
     """
     Detecta pantallas paginadas (Vocabulario, Explicación) con varios
