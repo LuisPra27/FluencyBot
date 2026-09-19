@@ -160,9 +160,13 @@ def _solve_multiple_choice(exercise, previous_attempts):
         return _solve_multiple_choice_audio(exercise, prompt_audio_url, option_audio_urls, previous_attempts)
 
     options_text = "\n".join(f"{i}. {opt}" for i, opt in enumerate(exercise["options"], start=1))
+    # Hay preguntas que son SOLO una imagen, sin enunciado de texto
+    # (confirmado en vivo: una imagen de una encuesta con las opciones
+    # "to circle" / "to check" / ...).
+    question = exercise["prompt"] or "(the question is the image below; answer according to what it shows)"
     text = (
         "You are solving an English (B1 level) multiple-choice exercise.\n"
-        f"Question: {exercise['prompt']}\n"
+        f"Question: {question}\n"
         f"Options:\n{options_text}"
         f"{_format_previous_attempts(previous_attempts)}\n\n"
         'Respond with ONLY a JSON object like {"answer": 3} using the 1-based '
@@ -233,8 +237,10 @@ def _solve_cloze_dropdown(exercise, previous_attempts):
         f"Text: {exercise['text']}\n\n"
         f"Options per blank:\n{blanks_text}"
         f"{_format_previous_attempts(previous_attempts)}\n\n"
+        f"There are EXACTLY {len(exercise['blanks'])} blank(s).\n"
         'Respond with ONLY a JSON object like {"answers": [1, 2, 0]} using the '
-        "0-based option index for each blank in order, no other text, no markdown."
+        "0-based option index for each blank IN ORDER (one number per blank, each "
+        "within that blank's own option list), no other text, no markdown."
     )
     return _ask_json(prompt)
 
@@ -537,7 +543,17 @@ def solve_exercise(exercise_data: dict, previous_attempts: list | None = None) -
         return solution
 
     if exercise_type == "cloze_dropdown":
-        return _solve_cloze_dropdown(exercise_data, previous_attempts)
+        solution = _solve_cloze_dropdown(exercise_data, previous_attempts)
+        # Confirmado en vivo: la IA devolvió [3, 1] para UN espacio de 3
+        # opciones (índices válidos 0-2). El bot fue a pulsar una opción
+        # inexistente y esperó 30 s.
+        blanks = exercise_data["blanks"]
+        answers = solution.get("answers") or []
+        if len(answers) != len(blanks) or any(
+            not isinstance(a, int) or not (0 <= a < len(opts)) for a, opts in zip(answers, blanks)
+        ):
+            raise ValueError(f"respuesta inválida para {len(blanks)} espacio(s) de {[len(o) for o in blanks]} opciones: {answers}")
+        return solution
 
     if exercise_type == "cloze_input":
         return _solve_cloze_input(exercise_data, previous_attempts)

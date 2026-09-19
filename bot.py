@@ -658,6 +658,7 @@ def _wait_for_activity_screen(page, timeout_ms=8000, poll_ms=500):
             browser.has_speech_modal(page)
             or browser.requires_speech(page)
             or browser.has_document(page)
+            or browser.has_review_checkbox(page)
             or browser.has_read_aloud_activity(page)
             or browser.has_video(page)
             or browser.has_paginated_content(page)
@@ -739,6 +740,14 @@ def _work_single_activity(page, activity):
                 browser.dismiss_speech_modal(page)
                 page.wait_for_timeout(500)
             print(f"  '{activity['type']}': video visto hasta el final; avanzo.")
+            _click_advance(page)
+            return solved_any
+
+        if browser.has_review_checkbox(page):
+            if browser.confirm_reviewed(page):
+                print(f"  '{activity['type']}': explicación marcada como revisada; avanzo.")
+            else:
+                print(f"  '{activity['type']}': no se pudo marcar 'He revisado esta explicación'.")
             _click_advance(page)
             return solved_any
 
@@ -979,6 +988,17 @@ def run_lesson(page, lesson_title, already_completed=0, max_skips=MAX_SKIPS):
         # solo-audio intercepta peticiones reales de red y es lo más lento
         # de get_current_exercise(). Bajarlo para tirarlo era tiempo puro
         # perdido en cada "Reanudar", que siempre reinicia desde el paso 1.
+        # "Explicación" con casilla "He revisado esta explicación": hay que
+        # marcarla o el botón se queda en "Omitir" y queda "Omitida".
+        if browser.has_review_checkbox(page):
+            browser.confirm_reviewed(page)
+            print(f"'{lesson_title}': explicación marcada como revisada; avanzo...")
+            skip_button = page.locator('[data-qa="SubmitButton"]')
+            if skip_button.count() > 0:
+                skip_button.first.click()
+                page.wait_for_timeout(1500)
+            continue
+
         # "Documento": hay que desplazarlo hasta el final para que el botón
         # deje de decir "Omitir"; si no, queda "Omitida".
         if browser.has_document(page):

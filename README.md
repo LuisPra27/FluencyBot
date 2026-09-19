@@ -540,6 +540,12 @@ Ninguno se reconocía y todas sus actividades quedaban "Omitida" para siempre.
 
 Verificado en vivo: "The Welcome Desk" pasó de no reconocer ninguna actividad a quedar resuelta salvo la voz en 58 s, y "Preparing for an Interview, Part II" al 100% (`matching_audio_options` correcto al primer intento).
 
+### Más variantes encontradas corriendo el bot de punta a punta
+
+* [x] **"Explicación" con casilla "He revisado esta explicación"**: variante que no se pagina; hay que marcar la casilla o el botón se queda en "Omitir" y la actividad queda "Omitida" (`browser.confirm_reviewed()`).
+* [x] **Opción múltiple cuya pregunta es SOLO una imagen**, sin enunciado ni audio: no se detectaba porque la detección exigía `MultipleChoicePromptText` o `MultipleChoicePromptAudio`. Ahora basta con que haya opciones.
+* [x] **Índices fuera de rango de la IA**: devolvía "opción 5" en preguntas de 4 y `[3, 1]` para UN espacio de 3 opciones; el bot esperaba 30 s por un elemento inexistente. Ahora se valida el rango y la cantidad antes de aplicar (y el clic falla rápido), con lo que el intento pasa al camino de "a ciegas" y el ciclo sigue.
+
 ### El botón del pie y la revelación de la respuesta
 
 Rosetta usa un único `data-qa="SubmitButton"` para todo y solo le cambia el

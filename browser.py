@@ -554,6 +554,40 @@ def has_read_aloud_activity(page):
     )
 
 
+def has_review_checkbox(page):
+    """
+    Variante de "Explicación" que no se pagina: muestra la explicación
+    entera y exige marcar la casilla "He revisado esta explicación" para
+    habilitar el botón de avanzar. Sin marcarla, el botón se queda en
+    "Omitir" y la actividad quedaba "Omitida".
+    """
+    return page.locator('input[type="checkbox"]').count() > 0
+
+
+def confirm_reviewed(page, timeout_ms=5000):
+    """
+    Marca esa casilla y espera a que el botón del pie deje de decir
+    "Omitir". Devuelve True si lo consiguió.
+    """
+    box = page.locator('input[type="checkbox"]').first
+    try:
+        box.check(timeout=5000)
+    except Exception:
+        # La casilla real puede estar oculta tras un diseño propio: pulsar
+        # su etiqueta visible.
+        label = page.get_by_text("He revisado esta explicación.", exact=False)
+        if label.count() == 0:
+            return False
+        label.first.click(timeout=5000)
+    elapsed = 0
+    while elapsed < timeout_ms:
+        if get_action_button_label(page) not in (None, "Omitir"):
+            return True
+        page.wait_for_timeout(300)
+        elapsed += 300
+    return False
+
+
 def has_document(page):
     """
     Pantalla "Documento" ("Lea el documento y complete la lección"): una
@@ -953,6 +987,11 @@ def get_current_exercise(page, capture_audio=True):
     if (
         page.locator('[data-qa="MultipleChoicePromptText"]').count() > 0
         or page.locator('[data-qa="MultipleChoicePromptAudio"]').count() > 0
+        # Hay opciones múltiples cuya PREGUNTA es solo una imagen, sin texto
+        # ni audio (confirmado en vivo: una imagen de una encuesta y las
+        # opciones "to circle" / "to check" / ...). Sin este caso no se
+        # reconocían y quedaban "Omitida".
+        or page.locator('[data-qa="ChoiceButton"]').count() > 0
     ):
         choices = page.locator('[data-qa="ChoiceButton"]')
 
@@ -1265,7 +1304,8 @@ def select_cloze_option(page, blank_index, option):
 
     items = dropdown.locator('[data-qa^="MenuItem_"]')
     item = items.nth(option) if isinstance(option, int) else items.filter(has_text=option)
-    item.first.click()
+    # Timeout corto: si esa opción no existe, fallar rápido en vez de 30 s.
+    item.first.click(timeout=5000)
 
 
 def drag_matching_pair(page, word, target_index):
