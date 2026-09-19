@@ -104,6 +104,19 @@ BLOCKED_SPEECH = "speech"
 BLOCKED_DONE = "completed"
 BLOCKED_FAILED = "failed"
 
+# Memoria de ESTE proceso, que sobrevive a los reinicios de main().
+#
+# El bot reinicia main() desde cero tras un error inesperado. Antes, todo lo
+# que se sabía de la corrida vivía dentro de main() y se perdía en cada
+# reinicio: se volvía a entrar a las lecciones ya intentadas y, peor, a cada
+# lección "failed" se le sumaba otro fallo. Tres caídas bastaban para dejar
+# TODAS las lecciones reintentables bloqueadas para siempre — confirmado en
+# blocked_lessons.json: 39 de 42 en failures=3, muchas con pendientes que el
+# bot sí sabe resolver. El contador de fallos estaba contando reinicios, no
+# intentos reales.
+_SESSION_ATTEMPTED = set()   # claves "curso::lección" ya intentadas en este proceso
+_SESSION_COURSE_HINT = [0]   # curso donde se encontró la última lección pendiente
+
 
 def _load_blocked_lessons():
     """
@@ -147,23 +160,38 @@ def _save_blocked_lessons(blocked):
         json.dump(dict(sorted(blocked.items())), f, indent=2, ensure_ascii=False)
 
 
-def _mark_blocked(blocked, key, reason, pending=()):
+def _mark_blocked(blocked, key, reason, pending=(), lesson_path=None, count_failure=True):
     """
     Registra por qué no hay que volver a entrar a una lección. "speech" y
     "completed" son definitivos y no acumulan fallos; solo "failed" suma un
     intento y se vuelve definitivo al llegar al tope.
+
+    count_failure=False: la lección no quedó completa, pero el intento SÍ
+    avanzó (aprendió respuestas que la próxima pasada puede usar). Contarlo
+    como fallo sería castigar justo el intento que más acerca al objetivo.
+
+    lesson_path (`course/<curso>/<lección>`) se guarda para poder cruzar la
+    lección con known_answers.json, cuyas claves usan esa ruta y no el título.
     """
-    previous_failures = blocked.get(key, {}).get("failures", 0)
+    previous = blocked.get(key, {})
+    previous_failures = previous.get("failures", 0)
+    if reason != BLOCKED_FAILED:
+        failures = 0
+    elif count_failure:
+        failures = previous_failures + 1
+    else:
+        failures = previous_failures
     blocked[key] = {
         "reason": reason,
-        "failures": previous_failures + 1 if reason == BLOCKED_FAILED else 0,
+        "failures": failures,
         "pending": sorted({a["type"] for a in pending}),
+        "lesson_path": lesson_path or previous.get("lesson_path"),
     }
     _save_blocked_lessons(blocked)
     return blocked[key]
 
 
-def _permanently_blocked_keys(blocked):
+def _permanently_blocked_keys(blocked, known_answers=None):
     """
     Las que de verdad no hay que volver a intentar: las de voz, las ya
     confirmadas como resueltas por el panel lateral (aunque el contador de
@@ -171,12 +199,24 @@ def _permanently_blocked_keys(blocked):
     El resto se vuelve a probar — revalidarlas
     cuesta una navegación y cero llamadas a la IA, mucho menos que dejar
     lecciones perfectamente resolubles marcadas para siempre.
+
+    Excepción al tope de fallos: si hay respuestas guardadas para esa
+    lección que todavía no se usaron, se vuelve a intentar igual. Tener la
+    respuesta a mano y no usarla es exactamente lo que no puede pasar.
     """
+    if known_answers is None:
+        known_answers = _load_known_answers()
+    answer_keys = list(known_answers)
+
+    def has_unused_answers(state):
+        path = state.get("lesson_path")
+        return bool(path) and any(k.startswith(path + "/") for k in answer_keys)
+
     return {
         key
         for key, state in blocked.items()
         if state.get("reason") in (BLOCKED_SPEECH, BLOCKED_DONE)
-        or state.get("failures", 0) >= MAX_LESSON_FAILURES
+        or (state.get("failures", 0) >= MAX_LESSON_FAILURES and not has_unused_answers(state))
     }
 
 
@@ -300,11 +340,18 @@ def apply_solution(page, exercise, solution):
         browser.click_option(page, solution["answer"])
 
     elif exercise_type == "cloze_dropdown":
-        for blank_index, answer in enumerate(solution["answers"], start=1):
+        for blank_index, answer in enumerate(solution["answers"][:len(exercise["blanks"])], start=1):
             browser.select_cloze_option(page, blank_index, answer)
 
     elif exercise_type == "cloze_input":
-        for blank_index, text in enumerate(solution["answers"], start=1):
+        # Solo se rellenan los espacios que existen. Confirmado en vivo: para
+        # un ejercicio de UN solo espacio la IA devolvió dos respuestas
+        # (['over', 'past']), el bot fue a buscar un segundo campo que no
+        # existe, esperó 30 s y el timeout tiró la lección entera.
+        answers = solution["answers"]
+        if len(answers) != exercise["blank_count"]:
+            print(f"  (aviso: la IA dio {len(answers)} respuesta(s) para {exercise['blank_count']} espacio(s); uso solo las necesarias)")
+        for blank_index, text in enumerate(answers[:exercise["blank_count"]], start=1):
             browser.fill_cloze_input(page, blank_index, text)
 
     elif exercise_type == "text_input":
@@ -315,7 +362,12 @@ def apply_solution(page, exercise, solution):
             browser.drag_matching_pair(page, word, target_index)
 
     elif exercise_type == "ordering":
-        browser.reorder_items(page, solution["order"])
+        if not browser.reorder_items(page, solution["order"]):
+            # No es un fallo de la respuesta sino de colocarla: se envía
+            # igual (no hay otra forma de seguir), pero que quede claro en
+            # el log que un "incorrect" aquí no significa que la respuesta
+            # estuviera mal.
+            print("  (aviso: no se logró dejar los ítems en el orden pedido; lo que se envía NO es esa respuesta)")
 
     else:
         raise NotImplementedError(f"No se sabe aplicar el tipo de ejercicio '{exercise_type}'")
@@ -368,6 +420,9 @@ def resolve_current_exercise(page, exercise, max_attempts=MAX_ATTEMPTS):
         # reapertura igual. Se borra y se sigue con la IA normalmente.
         print("La respuesta guardada no funcionó; la borro y sigo con la IA.")
         _forget_answer(key)
+        # Ya se probó y falló: que la IA no la repita (confirmado en vivo que
+        # sin esto proponía justo la misma opción que acababa de fallar).
+        previous_attempts.append(remembered)
         if browser.get_action_button_label(page) == "Volver a intentar":
             browser.submit_answer(page)
             page.wait_for_timeout(1000)
@@ -576,6 +631,7 @@ def _work_single_activity(page, activity):
 
         if browser.has_read_aloud_activity(page):
             # Requiere grabarse leyendo: es lo único que se acepta omitir.
+            print(f"  '{activity['type']}': es lectura en voz alta (requiere grabarse); se omite a propósito.")
             _click_advance(page)
             return solved_any
 
@@ -593,24 +649,37 @@ def _work_single_activity(page, activity):
                     break
                 browser.dismiss_speech_modal(page)
                 page.wait_for_timeout(500)
+            print(f"  '{activity['type']}': video visto hasta el final; avanzo.")
             _click_advance(page)
             return solved_any
 
         if browser.has_paginated_content(page):
             # Vocabulario/Explicación: paginar de verdad para que quede
             # "Completa" en vez de "Omitida".
+            pages = 0
             for _ in range(100):
                 if not browser.advance_paginated_content(page):
                     break
+                pages += 1
+            print(f"  '{activity['type']}': contenido paginado recorrido ({pages} página(s)); avanzo.")
             _click_advance(page)
             return solved_any
 
+        # Si la respuesta de este ejercicio ya está guardada, no hace falta
+        # capturar su audio: no se le va a preguntar a la IA. Confirmado en
+        # vivo que esa captura puede tardar ~40 s en darse por vencida
+        # cuando el servidor de audio falla, y se hacía igual justo antes
+        # de aplicar una respuesta que ya se sabía.
+        key = browser.get_exercise_key(page)
+        already_known = bool(key) and key in _load_known_answers()
         try:
-            exercise = browser.get_current_exercise(page)
+            exercise = browser.get_current_exercise(page, capture_audio=not already_known)
         except NotImplementedError:
             # Pantalla no reconocida (ej. Objetivos, o un video ya visto
             # esperando el clic de avance): avanzar igual que hace el
             # recorrido lineal.
+            print(f"  '{activity['type']}': pantalla no reconocida como ejercicio ({page.url.split('/course/')[-1]}); avanzo SIN resolver.")
+            _debug_screenshot_omit(page, activity['type'])
             _click_advance(page)
             return solved_any
         else:
@@ -715,8 +784,16 @@ def work_pending_activities(page, lesson_title):
             print(f"  '{activity['type']}' no llegó a mostrar nada con lo que trabajar; sigo con la siguiente.")
             continue
 
-        if _work_single_activity(page, activity):
-            fixed += 1
+        # Un error en UNA actividad no debe costar la lección entera.
+        # Confirmado en vivo: un timeout en un solo ejercicio subía hasta
+        # main(), la lección se daba por fallida y las demás actividades
+        # pendientes ni se intentaban.
+        try:
+            if _work_single_activity(page, activity):
+                fixed += 1
+        except PlaywrightTimeoutError as e:
+            print(f"  '{activity['type']}': error inesperado ({e.message.splitlines()[0]}); sigo con la siguiente.")
+            _debug_screenshot_omit(page, activity["type"])
 
         # Volver al resumen deja la página en un punto conocido para el
         # siguiente salto; si se falla, el propio open_activity de la
@@ -1017,6 +1094,8 @@ def run_lesson(page, lesson_title, already_completed=0, max_skips=MAX_SKIPS):
         return "completed", pending
 
     detail = ", ".join(f"{a['type']} ({a['status'] or 'sin empezar'})" for a in pending)
+    not_speech = [a for a in pending if a["type"] not in browser.SPEECH_ACTIVITY_TYPES]
+    not_speech_detail = ", ".join(f"{a['type']} ({a['status'] or 'sin empezar'})" for a in not_speech)
     if browser.all_pending_are_speech(pending):
         print(
             f"Lección '{lesson_title}': lo único pendiente requiere grabar tu voz [{detail}]. "
@@ -1024,58 +1103,57 @@ def run_lesson(page, lesson_title, already_completed=0, max_skips=MAX_SKIPS):
         )
         return "speech_blocked", pending
 
-    print(f"Lección '{lesson_title}' quedó con {len(pending)} actividad(es) pendientes que NO son de voz: {detail}")
+    print(
+        f"Lección '{lesson_title}' quedó con {len(not_speech)} actividad(es) pendientes que NO son de voz: "
+        f"{not_speech_detail}" + (f" (más {len(pending) - len(not_speech)} de voz)" if len(pending) > len(not_speech) else "")
+    )
     return "failed", pending
-
-
-def _counter_still_lags(page, lesson_title):
-    """
-    Tras salir de una lección estamos en la página de su curso. Devuelve
-    True si el contador de Rosetta SIGUE diciendo que a esa lección le
-    faltan actividades — o sea, que no coincide con el panel lateral, que
-    ya las daba todas por resueltas.
-
-    Confirmado en vivo: el contador se queda desincronizado ("16 de 17")
-    aunque el panel muestre las 17 en Correcta/Completa, y como
-    find_next_lesson() filtra por el contador, la lección se volvía a
-    elegir una y otra vez.
-
-    Ante cualquier problema para leerlo, devuelve True: es el lado seguro
-    (se deja de reintentar esa lección) frente a arriesgarse al bucle.
-    """
-    try:
-        lesson = next((l for l in browser.get_lessons(page) if l["title"] == lesson_title), None)
-    except Exception as e:
-        print(f"(no se pudo releer el contador de '{lesson_title}': {e})")
-        return True
-    if lesson is None:
-        return True
-    return lesson["completed"] < lesson["total"]
 
 
 def find_next_lesson(page, skip_keys=()):
     """
-    Recorre todos los cursos buscando la primera lección con actividades
-    pendientes (cuya clave "curso::lección" no esté en skip_keys) y la abre.
-    Devuelve (título_lección, actividades_ya_completadas, título_curso), o
+    Busca la primera lección con actividades pendientes (cuya clave
+    "curso::lección" no esté en skip_keys) y la abre. Devuelve
+    (título_lección, actividades_ya_completadas, título_curso), o
     (None, 0, None) si no queda ninguna.
 
-    skip_keys: claves "curso::lección" a ignorar aunque tengan actividades
-    pendientes (ej. las ya confirmadas como bloqueadas por voz, cargadas
-    desde speech_only_lessons.json o acumuladas en esta misma corrida).
+    **Empieza por el curso donde encontró la última**, no por el primero.
+    Antes recorría todos los cursos desde el 0 en cada búsqueda, entrando
+    en cada uno (~4 s por curso): si la siguiente lección estaba en el
+    curso 20, se iba más de un minuto solo en encontrarla, y eso se repetía
+    con CADA lección. Los cursos anteriores ya quedaron agotados en esta
+    sesión, así que empezar ahí no se salta nada; igualmente se da la
+    vuelta completa al final para no perder nada.
+
+    Un curso cuya página no carga bien (visto en vivo: timeout leyendo su
+    título) se salta en vez de tumbar toda la búsqueda y forzar un
+    reinicio.
     """
     browser.go_to_courses(page)
     course_count = browser.get_courses(page)
+    if course_count == 0:
+        return None, 0, None
 
-    for course_index in range(course_count):
-        browser.go_to_courses(page)
-        browser.start_course(page, course_index)
-        course_title = browser.get_course_title(page)
+    start = _SESSION_COURSE_HINT[0] % course_count
+    for offset in range(course_count):
+        course_index = (start + offset) % course_count
+        try:
+            browser.go_to_courses(page)
+            browser.start_course(page, course_index)
+            course_title = browser.get_course_title(page)
+            lessons = browser.get_lessons(page)
+        except PlaywrightTimeoutError as e:
+            print(f"(no se pudo leer el curso {course_index + 1}/{course_count}: {e.message.splitlines()[0]}; lo salto)")
+            continue
 
-        for lesson_index, lesson in enumerate(browser.get_lessons(page)):
+        for lesson_index, lesson in enumerate(lessons):
             key = f"{course_title}::{lesson['title']}"
             if lesson["completed"] < lesson["total"] and key not in skip_keys:
-                print(f"Iniciando lección '{lesson['title']}' ({lesson['completed']}/{lesson['total']} ya completadas)...")
+                _SESSION_COURSE_HINT[0] = course_index
+                print(
+                    f"Iniciando lección '{lesson['title']}' ({lesson['completed']}/{lesson['total']} ya completadas) "
+                    f"[curso {course_index + 1}/{course_count}: {course_title}]..."
+                )
                 browser.start_lesson(page, lesson_index)
                 return lesson["title"], lesson["completed"], course_title
 
@@ -1102,13 +1180,20 @@ def main():
             print("Captura guardada: fluency_builder.png")
 
             blocked = _load_blocked_lessons()
-            skip_keys = _permanently_blocked_keys(blocked)
-            retryable = len(blocked) - len(skip_keys)
+            permanent = _permanently_blocked_keys(blocked)
+            retryable = len(blocked) - len(permanent)
             if blocked:
                 print(
-                    f"{len(skip_keys)} lección(es) bloqueadas de verdad (voz o {MAX_LESSON_FAILURES} "
-                    f"fallos) se omiten; {retryable} se van a revalidar por si ya son resolubles."
+                    f"{len(permanent)} lección(es) bloqueadas de verdad (voz, ya resueltas, o "
+                    f"{MAX_LESSON_FAILURES} fallos sin respuestas pendientes) se omiten; "
+                    f"{retryable} se van a revalidar por si ya son resolubles."
                 )
+            if _SESSION_ATTEMPTED:
+                print(
+                    f"Reinicio tras un error: {len(_SESSION_ATTEMPTED)} lección(es) ya intentadas en esta "
+                    "sesión no se vuelven a abrir (y no se les suma otro fallo)."
+                )
+            skip_keys = permanent | _SESSION_ATTEMPTED
 
             while True:
                 lesson_title, already_completed, course_title = find_next_lesson(page, skip_keys=skip_keys)
@@ -1125,6 +1210,9 @@ def main():
                 # en vivo con el contador desincronizado). La memoria entre
                 # corridas la lleva blocked_lessons.json, no esta variable.
                 skip_keys.add(key)
+                _SESSION_ATTEMPTED.add(key)
+                lesson_path = browser.get_lesson_path(page)
+                answers_before = set(_load_known_answers())
                 try:
                     result, pending = run_lesson(page, lesson_title, already_completed=already_completed)
                 except PlaywrightTimeoutError as e:
@@ -1137,12 +1225,21 @@ def main():
                     # quedar marcado como bloqueado (gastando los reintentos
                     # del wrapper en vano). Marcar y seguir con la próxima.
                     print(f"Timeout inesperado en '{lesson_title}': {e}")
-                    state = _mark_blocked(blocked, key, BLOCKED_FAILED)
+                    state = _mark_blocked(blocked, key, BLOCKED_FAILED, lesson_path=lesson_path)
                     print(
                         f"'{key}': fallo {state['failures']}/{MAX_LESSON_FAILURES} por timeout. "
                         + ("No se vuelve a intentar." if state["failures"] >= MAX_LESSON_FAILURES
                            else "Se reintentará en otra corrida.")
                     )
+                    # Tras un timeout seguimos DENTRO de la lección, donde el
+                    # enlace "Mis cursos" no existe: ir directo ahí daba otro
+                    # timeout y tumbaba la corrida entera (confirmado en vivo).
+                    # Primero salir de la lección; si ni eso funciona, que
+                    # lo resuelva el reinicio.
+                    try:
+                        browser.exit_lesson(page)
+                    except Exception as exit_error:
+                        print(f"(no se pudo salir de la lección tras el timeout: {exit_error})")
                     browser.go_to_courses(page)
                     continue
 
@@ -1150,31 +1247,34 @@ def main():
                 # el resultado y se sigue con la próxima lección. Solo un error
                 # inesperado (fuera de run_lesson) pausa de verdad, más abajo.
                 if result == "completed":
-                    # El contador de Rosetta puede tardar en sincronizar: se
-                    # queda diciendo "16 de 17" aunque el panel lateral ya
-                    # muestre TODAS las actividades en Correcta/Completa.
-                    # find_next_lesson() filtra justamente por ese contador,
-                    # así que sin esto el bot vuelve a elegir la misma
-                    # lección, entra, no encuentra nada pendiente, sale, y
-                    # la vuelve a elegir — bucle infinito confirmado en vivo.
-                    # El panel es la fuente de verdad, no el contador.
-                    if _counter_still_lags(page, lesson_title):
-                        _mark_blocked(blocked, key, BLOCKED_DONE)
-                        print(
-                            f"'{key}': el panel dice que está toda resuelta pero el contador de Rosetta "
-                            "aún no se sincronizó; la doy por hecha y no vuelvo a entrar."
-                        )
-                    elif blocked.pop(key, None) is not None:
-                        _save_blocked_lessons(blocked)
-                        print(f"'{key}' estaba marcada como bloqueada y se completó: la quito de la lista.")
+                    # Se guarda SIEMPRE como "completed", sin consultar el
+                    # contador de Rosetta. El contador puede quedarse en
+                    # "16 de 17" aunque el panel lateral muestre todo en
+                    # Correcta/Completa, y como find_next_lesson() filtra por
+                    # él, la lección se volvía a abrir en cada corrida.
+                    # Antes se intentaba detectar ese desfase releyendo el
+                    # contador al salir, pero confirmado en vivo que no es
+                    # fiable: justo al salir la página enseña un número que
+                    # luego no se mantiene. Guardarla no cuesta nada si el
+                    # contador ya estaba bien (entonces no se volvería a
+                    # elegir de todos modos). El panel manda, no el contador.
+                    _mark_blocked(blocked, key, BLOCKED_DONE, lesson_path=lesson_path)
+                    print(f"'{key}': resuelta según el panel lateral; no se vuelve a abrir.")
                     continue
 
                 # Se omite el resto de la corrida para esta lección SIEMPRE,
                 # pero solo se deja de intentar en el futuro si el motivo es
                 # definitivo (voz) o si ya agotó sus reintentos.
+                learned = set(_load_known_answers()) - answers_before
                 state = _mark_blocked(
-                    blocked, key, BLOCKED_SPEECH if result == "speech_blocked" else BLOCKED_FAILED, pending
+                    blocked, key, BLOCKED_SPEECH if result == "speech_blocked" else BLOCKED_FAILED, pending,
+                    lesson_path=lesson_path, count_failure=not learned,
                 )
+                if learned and state["reason"] == BLOCKED_FAILED:
+                    print(
+                        f"'{key}': no quedó completa, pero aprendió {len(learned)} respuesta(s); "
+                        "no lo cuento como fallo y la próxima vez las usa."
+                    )
                 if state["reason"] == BLOCKED_SPEECH:
                     print(f"'{key}': bloqueada definitivamente (solo queda voz). Sigo con la próxima.")
                 else:

@@ -6,3 +6,4 @@ __pycache__/
 blocked_lessons.json
 known_answers.json
 logs/
+blocked_lessons.backup-*.json

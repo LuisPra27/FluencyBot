@@ -196,8 +196,9 @@ def _solve_cloze_input(exercise, previous_attempts):
         "(e.g. ___1___ is where blank 1 goes).\n"
         f"Text: {exercise['text']}"
         f"{_format_previous_attempts(previous_attempts)}\n\n"
-        'Respond with ONLY a JSON object like {"answers": ["not", "very"]} '
-        "with one string per blank, in order, no other text, no markdown."
+        f"There are EXACTLY {exercise['blank_count']} blank(s). "
+        'Respond with ONLY a JSON object like {"answers": ["not"]} with EXACTLY '
+        f"{exercise['blank_count']} string(s), one per blank, in order, no other text, no markdown."
     )
     return _ask_json(text)
 
@@ -317,10 +318,10 @@ def _solve_ordering(exercise, previous_attempts):
         "a grammatically correct sentence).\n"
         f"Items (currently in a random order):\n{items_text}"
         f"{_format_previous_attempts(previous_attempts)}\n\n"
-        'Respond with ONLY a JSON object like {"order": [3, 1, 0, 2, 4]} listing '
-        "the 0-based indices of the items above in the correct final order "
-        "(same length as the items, each index used exactly once), no other "
-        "text, no markdown."
+        f"There are EXACTLY {len(items)} items, numbered 0 to {len(items) - 1}. "
+        f'Respond with ONLY a JSON object like {{"order": {list(reversed(range(len(items))))}}} listing '
+        f"ALL {len(items)} indices in the correct final order, each index exactly once "
+        "(do not drop any item), no other text, no markdown."
     )
     result = _ask_json(text)
     order_indices = result["order"]

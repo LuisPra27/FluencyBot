@@ -460,7 +460,24 @@ def has_read_aloud_activity(page):
     el log que es una omisión intencional (de habla) y no un hueco real
     de mapeo.
     """
-    return page.get_by_text("Lectura en voz alta", exact=True).count() > 0
+    # OJO: se ignora el panel lateral a propósito. Ahí aparece
+    # "Lectura en voz alta" como NOMBRE de otra actividad de la lección, y
+    # buscar el texto en toda la página hacía que CUALQUIER pantalla de una
+    # lección con lectura en voz alta se tomara por una. Confirmado con el
+    # DOM real: en una pantalla de opción múltiple normal devolvía True, y
+    # como work_pending_activities() mira esto antes que el ejercicio, cada
+    # actividad reabierta en esas lecciones se omitía en silencio. Era la
+    # causa de que tantas lecciones quedaran bloqueadas con pendientes que el
+    # bot sí sabe resolver.
+    return page.evaluate(
+        """
+        () => Array.from(document.querySelectorAll('body *')).some(
+            (el) => el.childElementCount === 0
+                && el.textContent.trim() === 'Lectura en voz alta'
+                && !el.closest('[data-qa="ActivityMapList"]')
+        )
+        """
+    )
 
 
 def has_paginated_content(page):
@@ -866,7 +883,7 @@ def fill_cloze_input(page, blank_index, text):
     lleno, y el clic caía como no-op silencioso: el texto se veía escrito
     pero nunca se enviaba (confirmado en vivo por el usuario).
     """
-    page.locator('[data-qa="ClozeInput"]').nth(blank_index - 1).fill(text)
+    page.locator('[data-qa="ClozeInput"]').nth(blank_index - 1).fill(text, timeout=5000)
     page.wait_for_timeout(300)
 
 
@@ -935,16 +952,33 @@ def get_ordering_items(page):
     return [items.nth(i).inner_text() for i in range(items.count())]
 
 
-def _drag_ordering_item(page, source_locator, target_locator):
+def _drag_ordering_item(page, source_locator, target_locator, moving_down):
+    """
+    Arrastra un ítem sobre otro. **Dónde se suelta importa**: la librería de
+    arrastre inserta antes o después del destino según a qué mitad llegues.
+    Soltar en el CENTRO (como se hacía antes) hacía que al bajar un ítem
+    cayera una posición de más, la corrección siguiente lo deshacía, y el
+    bucle oscilaba hasta agotar los movimientos sin llegar nunca al orden
+    pedido — confirmado en vivo con una respuesta guardada CORRECTA que igual
+    salió "incorrecta" (Rosetta reveló después exactamente ese orden).
+    Ahora: subiendo se suelta junto al borde superior del destino, bajando
+    junto al inferior.
+    """
     source_box = source_locator.bounding_box()
     target_box = target_locator.bounding_box()
-    page.mouse.move(source_box["x"] + source_box["width"] / 2, source_box["y"] + source_box["height"] / 2)
+    start_x = source_box["x"] + source_box["width"] / 2
+    start_y = source_box["y"] + source_box["height"] / 2
+    edge = min(8, target_box["height"] / 4)
+    end_y = (target_box["y"] + target_box["height"] - edge) if moving_down else (target_box["y"] + edge)
+    end_x = target_box["x"] + target_box["width"] / 2
+
+    page.mouse.move(start_x, start_y)
     page.mouse.down()
-    page.mouse.move(
-        target_box["x"] + target_box["width"] / 2,
-        target_box["y"] + target_box["height"] / 2,
-        steps=10,
-    )
+    # Un primer movimiento corto: las librerías de arrastre no empiezan a
+    # arrastrar hasta superar un umbral de distancia.
+    page.mouse.move(start_x, start_y + (6 if moving_down else -6), steps=3)
+    page.mouse.move(end_x, end_y, steps=15)
+    page.wait_for_timeout(150)
     page.mouse.up()
     page.wait_for_timeout(400)
 
@@ -970,7 +1004,7 @@ def reorder_items(page, target_order):
             if current[i] != wanted_text:
                 src_index = current.index(wanted_text)
                 items = page.locator('[data-qa="DraggableSentenceItem"]')
-                _drag_ordering_item(page, items.nth(src_index), items.nth(i))
+                _drag_ordering_item(page, items.nth(src_index), items.nth(i), moving_down=src_index < i)
                 break
     return get_ordering_items(page) == target_order
 
@@ -1096,6 +1130,22 @@ def exercise_is_locked(page):
 
 
 SHOW_ANSWER_LABEL = "Mostrar respuesta"
+
+
+def get_lesson_path(page):
+    """
+    Ruta de la lección actual dentro del curso (`course/<curso>/<lección>`),
+    o None fuera de una lección. Es el prefijo de las claves de
+    get_exercise_key(), lo que permite saber si hay respuestas guardadas
+    pendientes de usar para una lección concreta.
+    """
+    parts = page.url.split("//", 1)[-1].split("/", 1)
+    if len(parts) < 2:
+        return None
+    segments = parts[1].strip("/").split("/")
+    if len(segments) < 3 or segments[0] != "course":
+        return None
+    return "/".join(segments[:3])
 
 
 def get_exercise_key(page):
