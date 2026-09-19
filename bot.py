@@ -459,11 +459,19 @@ def resolve_current_exercise(page, exercise, max_attempts=MAX_ATTEMPTS):
             # audio a veces alucina y se queda repitiendo hasta agotar
             # tokens). Que cuente como intento fallido normal, no que tumbe
             # todo el ejercicio.
-            print(f"Intento {attempt}/{max_attempts} - la IA no devolvió una solución válida: {e}")
-            feedback = "incorrect"
-            if attempt < max_attempts:
-                continue
-            return feedback
+            print(f"Intento {attempt}/{max_attempts} - la IA no devolvió una solución válida: {str(e)[:160]}")
+            # Sin solución de la IA el intento no llega a Rosetta, y sin
+            # intentos fallidos Rosetta nunca ofrece "Mostrar respuesta":
+            # el bot se quedaba sin aprender nada. Si el tipo lo permite, se
+            # intenta a ciegas para que el ciclo siga hasta la revelación.
+            try:
+                solution = ai._blind_guess(exercise, previous_attempts)
+                print(f"  (intento a ciegas para poder avanzar hasta la respuesta revelada: {solution})")
+            except NotImplementedError:
+                feedback = "incorrect"
+                if attempt < max_attempts:
+                    continue
+                return feedback
 
         print(f"Intento {attempt}/{max_attempts} - Solución de la IA:", solution)
 
@@ -686,18 +694,8 @@ def _work_single_activity(page, activity):
             _click_advance(page)
             return solved_any
 
-        # Si la respuesta de este ejercicio ya está guardada, no hace falta
-        # capturar su audio: no se le va a preguntar a la IA. Confirmado en
-        # vivo que esa captura puede tardar ~40 s en darse por vencida
-        # cuando el servidor de audio falla, y se hacía igual justo antes
-        # de aplicar una respuesta que ya se sabía.
-        key = browser.get_exercise_key(page)
-        known = _load_known_answers().get(key) if key else None
-        # Excepción: si lo guardado es un clip de audio (opciones barajadas),
-        # SÍ hay que capturar el audio para saber dónde quedó ese clip hoy.
-        skip_audio = known is not None and "answer_audio_id" not in known
         try:
-            exercise = browser.get_current_exercise(page, capture_audio=not skip_audio)
+            exercise = browser.get_current_exercise(page)
         except NotImplementedError:
             # Pantalla no reconocida (ej. Objetivos, o un video ya visto
             # esperando el clic de avance): avanzar igual que hace el

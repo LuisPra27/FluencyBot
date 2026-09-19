@@ -871,7 +871,8 @@ def click_option(page, option):
         locator = page.locator(f'[data-qa-choice="ChoiceButton_{option}"]')
     else:
         locator = page.locator('[data-qa="ChoiceButton"]').filter(has_text=option)
-    locator.first.click()
+    # Timeout corto: si la opción no existe, fallar rápido en vez de 30 s.
+    locator.first.click(timeout=5000)
 
 
 def get_cloze_text(page):

@@ -28,6 +28,13 @@ AUDIO_MODEL = "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"
 
 _client = OpenAI(base_url="https://integrate.api.nvidia.com/v1", api_key=config.AI_API_KEY)
 
+# Tope por llamada a la IA. Confirmado en vivo que el modelo de audio (que
+# razona antes de responder) puede tardar más de 5 minutos en UNA respuesta,
+# y encima equivocarse. Desde que el bot aprende la respuesta que Rosetta
+# revela tras dos fallos, esperar tanto no compensa: mejor fallar rápido y
+# llegar antes a "Mostrar respuesta".
+AI_TIMEOUT_S = 90
+
 
 def _ask_json(content, max_tokens=3000, model=MODEL):
     """
@@ -39,6 +46,7 @@ def _ask_json(content, max_tokens=3000, model=MODEL):
         model=model,
         messages=[{"role": "user", "content": content}],
         max_tokens=max_tokens,
+        timeout=AI_TIMEOUT_S,
     )
     message = response.choices[0].message
 
@@ -99,6 +107,25 @@ def _blind_guess(exercise_data, previous_attempts):
         random.shuffle(order)
         return {"pairs": {word: order[i % target_count] for i, word in enumerate(words)}}
 
+    # Para el resto no hay forma útil de "adivinar", pero tampoco hace falta:
+    # basta con enviar ALGO para gastar el intento y que Rosetta acabe
+    # ofreciendo "Mostrar respuesta", de donde el bot aprende la buena. Así
+    # ni siquiera una caída total de la IA (como el apagón de
+    # muse-glimmer-30b) bloquea el avance.
+    if exercise_type == "cloze_dropdown":
+        return {"answers": [random.randrange(len(opts)) for opts in exercise_data["blanks"]]}
+
+    if exercise_type == "cloze_input":
+        return {"answers": ["x"] * exercise_data["blank_count"]}
+
+    if exercise_type == "text_input":
+        return {"answer": "x"}
+
+    if exercise_type == "ordering":
+        items = list(exercise_data["items"])
+        random.shuffle(items)
+        return {"order": items}
+
     raise NotImplementedError(f"No se sabe adivinar a ciegas el tipo '{exercise_type}'")
 
 
@@ -115,7 +142,8 @@ def _solve_multiple_choice(exercise, previous_attempts):
         f"Options:\n{options_text}"
         f"{_format_previous_attempts(previous_attempts)}\n\n"
         'Respond with ONLY a JSON object like {"answer": 3} using the 1-based '
-        "option number, no other text, no markdown."
+        f"option number (from 1 to {exercise.get('option_count') or len(exercise.get('options') or [])}), "
+        "no other text, no markdown."
     )
 
     image_url = exercise.get("image_url")
@@ -156,7 +184,8 @@ def _solve_multiple_choice_audio(exercise, prompt_audio_url, option_audio_urls, 
         f"{options_desc}"
         f"{_format_previous_attempts(previous_attempts)}\n\n"
         'Respond with ONLY a JSON object like {"answer": 3} using the 1-based '
-        "option number, no other text, no markdown."
+        f"option number (from 1 to {exercise.get('option_count') or len(exercise.get('options') or [])}), "
+        "no other text, no markdown."
     )
     content = [{"type": "text", "text": text}]
     if prompt_audio_url:
@@ -292,14 +321,20 @@ def _solve_matching_audio(exercise, previous_attempts):
     target_audio_urls = exercise["target_audio_urls"]
     target_count = len(target_audio_urls)
 
+    # Confirmado en vivo que la redacción anterior confundía al modelo: en su
+    # razonamiento dudaba si tenía que devolver el número de la FRASE o el del
+    # CLIP. Ahora se numeran los clips explícitamente y se dice qué número va.
+    phrases_text = "\n".join(f"- {w}" for w in words)
     text = (
-        "You are matching English (B1 level) phrases to spoken audio clips. "
-        f"The targets are given as audio clips below, in order (target 1, target 2, "
-        f"..., target {target_count}). Listen to each clip and match it to the phrase "
-        f"that best completes or explains it.\nPhrases: {words}"
+        "You are matching English (B1 level) phrases to spoken audio clips.\n"
+        f"Below are {target_count} audio clips, in order: AUDIO 1, AUDIO 2, ..., AUDIO {target_count}.\n"
+        "Listen to each clip. Then, for EACH phrase below, decide which audio clip it "
+        "goes with (the phrase that best completes or describes what is said in that clip).\n"
+        f"Phrases:\n{phrases_text}\n"
+        f"Each audio number (1 to {target_count}) must be used exactly once."
         f"{_format_previous_attempts(previous_attempts)}\n\n"
-        'Respond with ONLY a JSON object mapping each phrase (exact text) to the '
-        'target number, e.g. {"She lowers the flaps.": 1}, no other text, no markdown.'
+        'Respond with ONLY a JSON object mapping each phrase (copied EXACTLY) to its AUDIO '
+        'number, e.g. {"<phrase>": 2}, no other text, no markdown.'
     )
     content = [{"type": "text", "text": text}]
     for url in target_audio_urls:
@@ -365,7 +400,14 @@ def solve_exercise(exercise_data: dict, previous_attempts: list | None = None) -
         return _blind_guess(exercise_data, previous_attempts)
 
     if exercise_type == "multiple_choice":
-        return _solve_multiple_choice(exercise_data, previous_attempts)
+        solution = _solve_multiple_choice(exercise_data, previous_attempts)
+        # Confirmado en vivo: la IA respondió "opción 5" en una pregunta de 4.
+        # El bot fue a pulsar una quinta opción inexistente y esperó 30 s.
+        count = exercise_data.get("option_count") or len(exercise_data.get("options") or [])
+        answer = solution.get("answer")
+        if count and not (isinstance(answer, int) and 1 <= answer <= count):
+            raise ValueError(f"respuesta fuera de rango: {answer!r} (hay {count} opciones)")
+        return solution
 
     if exercise_type == "cloze_dropdown":
         return _solve_cloze_dropdown(exercise_data, previous_attempts)
