@@ -229,6 +229,7 @@ FluencyBot/
 ├── .gitignore
 ├── blocked_lessons.json   # generado por el bot: {"curso::lección": {reason, failures, pending}}
 ├── known_answers.json     # generado por el bot: respuestas que Rosetta enseñó, por ejercicio
+├── logs/                  # generado por el bot: un bot_<fecha>_<hora>.log por corrida
 └── README.md
 ```
 
@@ -504,6 +505,8 @@ locator.click()
 
 * [x] **Bucle infinito por el contador desincronizado de Rosetta.** Confirmado en vivo: el contador de una lección se queda en "16 de 17" aunque el panel lateral muestre las 17 actividades en Correcta/Completa. Como `find_next_lesson()` filtra por ese contador, elegía la misma lección una y otra vez — entrar, no encontrar nada pendiente, salir, repetir. Dos arreglos: (1) `main()` agrega la clave a `skip_keys` ANTES de intentar la lección, así ninguna se intenta más de una vez por corrida pase lo que pase; (2) al terminar completa se relee el contador con `_counter_still_lags()` y, si sigue desfasado, se guarda con `reason: "completed"` para no volver a entrar en futuras corridas. El panel lateral es la fuente de verdad, el contador no.
 * [x] **Un fallo al abrir el resumen se reportaba como lección completada.** `run_lesson()` dejaba `pending = []` cuando `go_to_lesson_summary()` fallaba, y luego `if not pending` lo interpretaba como "no queda nada". Ahora se distingue "no hay pendientes" de "no se pudo mirar": sin verificación devuelve `"failed"`.
+
+* [x] **Log de cada corrida en `logs/bot_<fecha>_<hora>.log`.** Copia de TODO lo que sale por consola —mensajes del bot, razonamiento de la IA y tracebacks de errores— con la hora al principio de cada línea (solo en el archivo; la consola se ve igual). Se hace duplicando stdout/stderr (`bot._Tee`), no cambiando cada `print()`, para que no se escape nada. Se vacía al disco en cada escritura: con la salida en buffer, detener el bot a mano perdía el log entero justo cuando más falta hacía. Solo se activa al ejecutar `bot.py`, no al importarlo, para que los scripts de prueba no vayan dejando logs.
 
 ### El botón del pie y la revelación de la respuesta
 

@@ -5,3 +5,4 @@ __pycache__/
 *.png
 blocked_lessons.json
 known_answers.json
+logs/

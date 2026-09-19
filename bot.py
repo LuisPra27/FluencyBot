@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+import time
 
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
@@ -14,6 +15,64 @@ import ai
 # nada.
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+LOGS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+
+
+class _Tee:
+    """
+    Duplica todo lo que se escribe en la consola a un archivo de log, con
+    la hora al principio de cada línea (solo en el archivo; la consola se
+    ve igual que siempre).
+
+    Se hace a nivel de stdout/stderr en vez de cambiar cada print() para
+    que el log tenga TODO: los mensajes del bot, el razonamiento de la IA y
+    los tracebacks de errores inesperados.
+
+    Se vacía al disco en cada escritura a propósito: confirmado en esta
+    misma historia que con la salida en buffer, detener el bot a mano
+    perdía el log entero justo cuando más se necesitaba leerlo.
+    """
+
+    def __init__(self, stream, log_file):
+        self._stream = stream
+        self._log = log_file
+        self._at_line_start = True
+
+    def write(self, text):
+        self._stream.write(text)
+        self._stream.flush()
+        for piece in text.splitlines(keepends=True):
+            if self._at_line_start and piece.strip():
+                self._log.write(time.strftime("[%H:%M:%S] "))
+            self._log.write(piece)
+            self._at_line_start = piece.endswith("\n")
+        self._log.flush()
+        return len(text)
+
+    def flush(self):
+        self._stream.flush()
+        self._log.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+def _start_logging():
+    """
+    Abre logs/bot_<fecha>_<hora>.log y redirige ahí una copia de toda la
+    salida. Un archivo por corrida, para poder comparar corridas. Se llama
+    solo al ejecutar bot.py directamente, no al importarlo (los scripts de
+    prueba importan bot y no deben ir dejando logs sueltos).
+    """
+    os.makedirs(LOGS_DIR, exist_ok=True)
+    path = os.path.join(LOGS_DIR, time.strftime("bot_%Y-%m-%d_%H-%M-%S.log"))
+    log_file = open(path, "a", encoding="utf-8", errors="replace")
+    sys.stdout = _Tee(sys.stdout, log_file)
+    sys.stderr = _Tee(sys.stderr, log_file)
+    print(f"Log de esta corrida: {path}")
+    return path
+
 
 MAX_ATTEMPTS = 3
 MAX_SKIPS = 10
@@ -1156,6 +1215,7 @@ def main():
 MAX_RESTARTS = 30
 
 if __name__ == "__main__":
+    _start_logging()
     for attempt in range(1, MAX_RESTARTS + 1):
         print(f"=== Intento {attempt}/{MAX_RESTARTS} ===")
         if main():
