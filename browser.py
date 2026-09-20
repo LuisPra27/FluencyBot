@@ -501,17 +501,17 @@ def get_flagged_activity_ids(page):
     ]
 
 
-def get_completed_activities(page):
+def get_lesson_activities(page):
     """
-    Debe estar en el resumen. Actividades que el panel marca "Completa"
-    pero NO "Correcta": están terminadas, pero algo de dentro no se acertó
-    —típicamente una pregunta que se cerró porque Rosetta acabó enseñando
-    la respuesta, cosa que no da crédito—. Cada una lleva su `position`
-    (1-based) entre las actividades de la lección, que es el número que
-    usa la URL (`…/<lección>/<actividad>/<paso>`).
+    Debe estar en el resumen. Todas las actividades de la lección (sin los
+    items que no lo son: objetivos y resumen), cada una con su `position`
+    (1-based). Esa posición es, casi siempre, el número que usa la URL
+    (`…/<lección>/<actividad>/<paso>`), lo que permite apuntar directo a
+    una actividad concreta — pero se comprueba SIEMPRE leyendo la URL ya
+    abierta, nunca se da por hecho.
     """
     activities = [a for a in get_activity_statuses(page) if a["id"] not in _NON_ACTIVITY_IDS]
-    return [dict(a, position=i + 1) for i, a in enumerate(activities) if a["status"] == "Completa"]
+    return [dict(a, position=i + 1) for i, a in enumerate(activities)]
 
 
 def open_activity(page, activity):

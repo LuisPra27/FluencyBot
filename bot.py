@@ -987,22 +987,25 @@ def redo_completed_with_answers(page, lesson_title, lesson_path):
         return 0
 
     speech_ids = _load_speech_ids()
-    candidates = [
-        a for a in browser.get_completed_activities(page)
-        if not browser.is_speech_activity(a, speech_ids)
-    ]
+    candidates = browser.get_lesson_activities(page)
     if not candidates:
         return 0
 
+    # La actividad que se busca es, casi siempre, la que está en esa misma
+    # posición del panel, así que se prueba primero: en el caso normal se
+    # acierta al primer intento. Si no cuadra, se sigue probando, pero con
+    # tope: abrir una actividad cuesta ~2,5 s y buscar a ciegas por una
+    # lección de 24 se iba a más de un minuto sin encontrar nada.
     candidates.sort(key=lambda a: 0 if str(a["position"]) in wanted else 1)
     print(
-        f"'{lesson_title}': {len(wanted)} respuesta(s) guardada(s) de actividades que quedaron "
-        "'Completa' (terminadas sin acertar); las reabro para dejarlas 'Correcta'..."
+        f"'{lesson_title}': {len(wanted)} respuesta(s) guardada(s) sin colocar; "
+        "reabro esas actividades para responderlas de memoria..."
     )
 
     fixed = 0
+    misses = 0
     for activity in candidates:
-        if not wanted:
+        if not wanted or misses >= 5:
             break
         try:
             browser.open_activity(page, activity)
@@ -1011,6 +1014,7 @@ def redo_completed_with_answers(page, lesson_title, lesson_path):
             continue
 
         if not _wait_for_activity_screen(page):
+            misses += 1
             browser.go_to_lesson_summary(page)
             continue
 
@@ -1020,10 +1024,24 @@ def redo_completed_with_answers(page, lesson_title, lesson_path):
             # No es una de las que tienen respuesta guardada: cerrar sin
             # tocar nada. Reabrir una actividad ya cerrada y dejarla a
             # medias podría empeorarla.
+            misses += 1
             browser.go_to_lesson_summary(page)
             continue
 
         wanted.discard(index)
+
+        # La respuesta puede ser de una actividad que exige hablar: se
+        # aprendió antes de saberlo y no hay forma de enviarla. Se descarta
+        # aquí mismo en vez de dejarla reabriendo la lección para siempre.
+        if browser.is_speech_activity(activity, speech_ids) or (
+            browser.requires_speech(page) and not browser.has_paginated_content(page)
+        ):
+            for stale in [k for k in _load_known_answers() if k.startswith(prefix + index + "/")]:
+                _forget_answer(stale)
+            print(f"  '{activity['type']}': exige hablar; su respuesta guardada no sirve, la descarto.")
+            browser.go_to_lesson_summary(page)
+            continue
+
         try:
             if _work_single_activity(page, activity):
                 fixed += 1
@@ -1032,22 +1050,19 @@ def redo_completed_with_answers(page, lesson_title, lesson_path):
             _debug_screenshot_omit(page, activity["type"])
         browser.go_to_lesson_summary(page)
 
-    print(f"'{lesson_title}': {fixed} actividad(es) 'Completa' respondidas de memoria.")
+    print(f"'{lesson_title}': {fixed} actividad(es) respondidas de memoria.")
 
-    # Respuestas que no se pudieron colocar en ninguna actividad "Completa".
-    # Si además ya no queda nada pendiente que no sea de voz, esa respuesta
-    # es de una actividad que NUNCA se va a poder enviar sin hablar
-    # (confirmado en vivo: un "Llene los espacios en blanco" que en realidad
-    # pide decir la oración completa; se aprendió su respuesta antes de
-    # saberlo). Guardarla solo sirve para reabrir la lección corrida tras
-    # corrida sin poder hacer nada, así que se descarta.
-    if wanted:
+    # Respuestas cuya actividad ni siquiera se encontró. Si lo único que
+    # queda pendiente es de voz, esa respuesta es de una actividad que
+    # nunca se va a poder enviar sin hablar, así que guardarla solo sirve
+    # para reabrir la lección corrida tras corrida sin poder hacer nada.
+    if wanted and browser.go_to_lesson_summary(page):
         pending = browser.get_pending_activities(page)
-        if pending and browser.all_pending_are_speech(pending, speech_ids):
-            leftover = [
-                key for key in _load_known_answers()
-                if key.startswith(prefix) and key[len(prefix):].split("/")[0] in wanted
-            ]
+        leftover = [
+            key for key in _load_known_answers()
+            if key.startswith(prefix) and key[len(prefix):].split("/")[0] in wanted
+        ]
+        if leftover and pending and browser.all_pending_are_speech(pending, speech_ids):
             for key in leftover:
                 _forget_answer(key)
             print(
@@ -1372,7 +1387,21 @@ def run_lesson(page, lesson_title, already_completed=0, max_skips=MAX_SKIPS):
     # Veredicto real de la lección, leído del panel lateral y no del
     # contador: el contador sube igual esté bien o mal, así que no sirve
     # para saber si algo quedó "Omitida"/"Vuelva a intentarlo".
-    verified = browser.go_to_lesson_summary(page)
+    #
+    # Se insiste un par de veces porque un solo intento fallido cuesta muy
+    # caro: sin resumen no hay veredicto, y una lección cuyo único
+    # pendiente era de voz se marcaba como fallo (confirmado en vivo en 'A
+    # Business Lunch', justo después de reabrir actividades). Entre intento
+    # e intento se descarta el modal de habla, que es lo que suele tapar el
+    # item del panel.
+    verified = False
+    for attempt in range(3):
+        verified = browser.go_to_lesson_summary(page)
+        if verified:
+            break
+        if browser.has_speech_modal(page):
+            browser.dismiss_speech_modal(page)
+        page.wait_for_timeout(1000)
     if verified:
         pending = browser.get_pending_activities(page)
 
