@@ -115,7 +115,11 @@ def _blind_guess(exercise_data, previous_attempts):
     # ni siquiera una caída total de la IA (como el apagón de
     # muse-glimmer-30b) bloquea el avance.
     if exercise_type == "cloze_dropdown":
-        return {"answers": [random.randrange(len(opts)) for opts in exercise_data["blanks"]]}
+        # `or [0]` porque un espacio puede llegar sin opciones legibles:
+        # `random.randrange(0)` reventaba ("empty range for randrange()") y
+        # el error, que solo debía gastar un intento, abortaba la actividad
+        # entera. Se manda un 0 y que falle el intento, como cualquier otro.
+        return {"answers": [random.choice(range(len(opts)) or [0]) for opts in exercise_data["blanks"]]}
 
     if exercise_type == "cloze_input":
         return {"answers": ["x"] * exercise_data["blank_count"]}

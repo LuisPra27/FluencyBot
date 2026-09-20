@@ -1228,19 +1228,24 @@ def click_option(page, option):
 def get_cloze_text(page):
     """
     Devuelve el texto del ejercicio "cloze_dropdown" con cada espacio en
-    blanco marcado explícitamente como "___N___" (N = número de
-    ClozeDropdown_N). Un simple inner_text() deja los espacios como saltos
-    de línea ambiguos, lo que confunde a la IA en textos largos con varios
-    blancos no consecutivos.
+    blanco marcado explícitamente como "___N___" (N = ORDEN en que aparece
+    el desplegable en la página). Un simple inner_text() deja los espacios
+    como saltos de línea ambiguos, lo que confunde a la IA en textos largos
+    con varios blancos no consecutivos.
+
+    Se numera por orden y no por el número del `data-qa` porque Rosetta
+    REPITE el nombre: confirmado en vivo un ejercicio con tres huecos y los
+    tres llamados `ClozeDropdown_1`. Numerándolos por su nombre, la IA
+    recibía "It ___1___ ... cuando yo ___1___ ... yo ___1___" y no había
+    forma de decirle a qué hueco corresponde cada respuesta.
     """
     return page.evaluate(
         """
         () => {
             const container = document.querySelector('[data-qa="step_content"]');
             const clone = container.cloneNode(true);
-            clone.querySelectorAll('[data-qa^="ClozeDropdown_"]').forEach((el) => {
-                const num = el.getAttribute('data-qa').replace('ClozeDropdown_', '');
-                el.replaceWith(document.createTextNode(` ___${num}___ `));
+            clone.querySelectorAll('[data-qa^="ClozeDropdown_"]').forEach((el, i) => {
+                el.replaceWith(document.createTextNode(` ___${i + 1}___ `));
             });
             return clone.innerText;
         }
@@ -1289,10 +1294,12 @@ def fill_cloze_input(page, blank_index, text):
 
 _OWN_DROPDOWN_JS = """
     ([blank, selector]) => {
+        const dropdowns = Array.from(document.querySelectorAll('[data-qa^="ClozeDropdown_"]'));
+        const owner = dropdowns[blank - 1];
+        if (!owner) return [];
         const out = [];
         document.querySelectorAll(selector).forEach((el, idx) => {
-            const owner = el.closest('[data-qa^="ClozeDropdown_"]');
-            if (owner && owner.getAttribute('data-qa') === `ClozeDropdown_${blank}`) out.push(idx);
+            if (el.closest('[data-qa^="ClozeDropdown_"]') === owner) out.push(idx);
         });
         return out;
     }
@@ -1302,15 +1309,23 @@ _OWN_DROPDOWN_JS = """
 def _own_dropdown_indices(page, blank_index, selector):
     """
     Posiciones (en orden del documento) de los elementos `selector` que
-    pertenecen DE VERDAD al espacio `blank_index`.
+    pertenecen DE VERDAD al espacio número `blank_index` (1-based, contado
+    por ORDEN en la página).
 
-    Hace falta porque los `ClozeDropdown_N` pueden venir ANIDADOS: se
-    confirmó en vivo un `ClozeDropdown_1` que contenía dentro los menús de
-    los otros dos espacios. Buscar dentro de él devolvía 3 botones (y
-    Playwright se negaba a actuar) y, peor todavía, devolvía también las
-    opciones de los otros espacios sin dar ningún error: la IA elegía sobre
-    una lista contaminada. Preguntando por el `closest` de cada elemento se
-    sabe de quién es realmente, esté anidado o no.
+    Dos razones para no fiarse del número del `data-qa`:
+
+    * Rosetta REPITE el nombre: confirmado en vivo un ejercicio con tres
+      huecos y los tres llamados `ClozeDropdown_1`. Por eso el espacio se
+      identifica por su orden y no por su número; si no, los huecos 2 y 3
+      se quedaban sin ninguna opción que ofrecer a la IA.
+    * Buscar "dentro del contenedor" tampoco sirve: con tres elementos
+      homónimos, `[data-qa="ClozeDropdown_1"] [data-qa="MenuButton"]`
+      devolvía 3 botones, Playwright se negaba a actuar ("strict mode
+      violation") y la excepción abortaba la actividad entera — tirando a
+      la basura las preguntas que ya estaban contestadas bien.
+
+    Preguntando por el `closest` de cada elemento se sabe de quién es
+    realmente, se repita el nombre o vengan anidados.
     """
     return page.evaluate(_OWN_DROPDOWN_JS, [blank_index, selector])
 
@@ -1839,16 +1854,17 @@ def get_revealed_answer(page, exercise):
             """
             () => {
                 const out = [];
-                for (let i = 1; ; i++) {
-                    const el = document.querySelector(`[data-qa="ClozeDropdown_${i}"]`);
-                    if (!el) break;
-                    // Con los desplegables ANIDADOS, el primer
-                    // MenuButtonLabel de dentro puede ser el de OTRO
-                    // espacio: se filtra por su dueño real.
+                // Por ORDEN, no por el número del data-qa: Rosetta repite
+                // el nombre (tres huecos, los tres "ClozeDropdown_1"), así
+                // que buscar por número solo encontraba el primero y la
+                // respuesta revelada se guardaba con un hueco en vez de
+                // tres. El dueño de cada etiqueta se comprueba con closest
+                // por si además vinieran anidados.
+                document.querySelectorAll('[data-qa^="ClozeDropdown_"]').forEach((el) => {
                     const label = Array.from(el.querySelectorAll('[data-qa="MenuButtonLabel"]'))
                         .find((candidate) => candidate.closest('[data-qa^="ClozeDropdown_"]') === el);
                     out.push(label ? label.textContent.trim() : '');
-                }
+                });
                 return out;
             }
             """
