@@ -8,3 +8,4 @@ known_answers.json
 logs/
 blocked_lessons.backup-*.json
 speech_activities.json
+debug_omits/
