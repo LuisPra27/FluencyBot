@@ -1033,6 +1033,28 @@ def redo_completed_with_answers(page, lesson_title, lesson_path):
         browser.go_to_lesson_summary(page)
 
     print(f"'{lesson_title}': {fixed} actividad(es) 'Completa' respondidas de memoria.")
+
+    # Respuestas que no se pudieron colocar en ninguna actividad "Completa".
+    # Si además ya no queda nada pendiente que no sea de voz, esa respuesta
+    # es de una actividad que NUNCA se va a poder enviar sin hablar
+    # (confirmado en vivo: un "Llene los espacios en blanco" que en realidad
+    # pide decir la oración completa; se aprendió su respuesta antes de
+    # saberlo). Guardarla solo sirve para reabrir la lección corrida tras
+    # corrida sin poder hacer nada, así que se descarta.
+    if wanted:
+        pending = browser.get_pending_activities(page)
+        if pending and browser.all_pending_are_speech(pending, speech_ids):
+            leftover = [
+                key for key in _load_known_answers()
+                if key.startswith(prefix) and key[len(prefix):].split("/")[0] in wanted
+            ]
+            for key in leftover:
+                _forget_answer(key)
+            print(
+                f"'{lesson_title}': {len(leftover)} respuesta(s) guardada(s) eran de actividades "
+                "que exigen hablar; las descarto para no reabrir la lección por ellas."
+            )
+
     return fixed
 
 
