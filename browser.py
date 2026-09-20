@@ -1287,6 +1287,40 @@ def fill_cloze_input(page, blank_index, text):
     page.wait_for_timeout(300)
 
 
+_OWN_DROPDOWN_JS = """
+    ([blank, selector]) => {
+        const out = [];
+        document.querySelectorAll(selector).forEach((el, idx) => {
+            const owner = el.closest('[data-qa^="ClozeDropdown_"]');
+            if (owner && owner.getAttribute('data-qa') === `ClozeDropdown_${blank}`) out.push(idx);
+        });
+        return out;
+    }
+"""
+
+
+def _own_dropdown_indices(page, blank_index, selector):
+    """
+    Posiciones (en orden del documento) de los elementos `selector` que
+    pertenecen DE VERDAD al espacio `blank_index`.
+
+    Hace falta porque los `ClozeDropdown_N` pueden venir ANIDADOS: se
+    confirmó en vivo un `ClozeDropdown_1` que contenía dentro los menús de
+    los otros dos espacios. Buscar dentro de él devolvía 3 botones (y
+    Playwright se negaba a actuar) y, peor todavía, devolvía también las
+    opciones de los otros espacios sin dar ningún error: la IA elegía sobre
+    una lista contaminada. Preguntando por el `closest` de cada elemento se
+    sabe de quién es realmente, esté anidado o no.
+    """
+    return page.evaluate(_OWN_DROPDOWN_JS, [blank_index, selector])
+
+
+def _own_dropdown_part(page, blank_index, selector):
+    """El primer `selector` que pertenece al espacio `blank_index`, o None."""
+    indices = _own_dropdown_indices(page, blank_index, selector)
+    return page.locator(selector).nth(indices[0]) if indices else None
+
+
 def get_cloze_options(page, blank_count):
     """
     Abre cada dropdown de un ejercicio "cloze_dropdown" para leer sus
@@ -1296,12 +1330,16 @@ def get_cloze_options(page, blank_count):
     """
     options_per_blank = []
     for i in range(1, blank_count + 1):
-        dropdown = page.locator(f'[data-qa="ClozeDropdown_{i}"]')
-        menu_button = dropdown.locator('[data-qa="MenuButton"]')
-        menu_button.click()
-        items = dropdown.locator('[data-qa^="MenuItem_"]')
-        options_per_blank.append([items.nth(j).inner_text() for j in range(items.count())])
-        menu_button.click()  # cerrar sin seleccionar
+        menu_button = _own_dropdown_part(page, i, '[data-qa="MenuButton"]')
+        if menu_button is None:
+            options_per_blank.append([])
+            continue
+        menu_button.click(timeout=5000)
+        page.wait_for_timeout(200)
+        items = page.locator('[data-qa^="MenuItem_"]')
+        own = _own_dropdown_indices(page, i, '[data-qa^="MenuItem_"]')
+        options_per_blank.append([items.nth(j).inner_text().strip() for j in own])
+        menu_button.click(timeout=5000)  # cerrar sin seleccionar
     return options_per_blank
 
 
@@ -1312,28 +1350,46 @@ def select_cloze_option(page, blank_index, option):
 
     blank_index: índice 1-based del espacio (ClozeDropdown_N).
     option: índice 0-based de la opción (MenuItem_N) o su texto exacto.
-    """
-    # `.first` en todo: confirmado en vivo que un ClozeDropdown_1 puede
-    # contener DENTRO los menús de los demás espacios (3 MenuButton en el
-    # mismo contenedor), y sin `.first` Playwright se niega a actuar
-    # ("strict mode violation") y el error tumbaba la corrida entera.
-    dropdown = page.locator(f'[data-qa="ClozeDropdown_{blank_index}"]').first
-    label = dropdown.locator('[data-qa="MenuButtonLabel"]').first
 
-    # Se comprueba que la selección quedó puesta y se reintenta: confirmado
-    # en vivo que un espacio podía quedarse sin elegir (con tres espacios,
-    # uno se quedaba vacío y el botón del pie seguía en "Omitir", así que la
-    # respuesta entera no se podía enviar).
+    Los elementos se buscan por su dueño real (`_own_dropdown_indices`) y no
+    dentro del contenedor: los `ClozeDropdown_N` pueden venir anidados.
+
+    Se comprueba que la selección quedó puesta y se reintenta: confirmado
+    en vivo que un espacio podía quedarse sin elegir (con tres espacios,
+    uno se quedaba vacío y el botón del pie seguía en "Omitir", así que la
+    respuesta entera no se podía enviar).
+    """
     for attempt in range(3):
-        dropdown.locator('[data-qa="MenuButton"]').first.click(timeout=5000)
+        menu_button = _own_dropdown_part(page, blank_index, '[data-qa="MenuButton"]')
+        if menu_button is None:
+            return False
+        # Timeout corto en todos los clics: si algo no está, fallar rápido
+        # en vez de esperar los 30 s por defecto.
+        menu_button.click(timeout=5000)
         page.wait_for_timeout(200)
-        items = dropdown.locator('[data-qa^="MenuItem_"]')
-        wanted = items.nth(option).inner_text().strip() if isinstance(option, int) else option
-        item = items.nth(option) if isinstance(option, int) else items.filter(has_text=option)
-        # Timeout corto: si esa opción no existe, fallar rápido en vez de 30 s.
-        item.first.click(timeout=5000)
+
+        items = page.locator('[data-qa^="MenuItem_"]')
+        own = _own_dropdown_indices(page, blank_index, '[data-qa^="MenuItem_"]')
+        texts = [items.nth(j).inner_text().strip() for j in own]
+
+        if isinstance(option, int):
+            if option >= len(texts):
+                menu_button.click(timeout=5000)  # cerrar sin elegir
+                return False
+            position, wanted = option, texts[option]
+        else:
+            wanted = option
+            matches = [k for k, t in enumerate(texts) if t == wanted] \
+                or [k for k, t in enumerate(texts) if wanted in t]
+            if not matches:
+                menu_button.click(timeout=5000)  # cerrar sin elegir
+                return False
+            position = matches[0]
+
+        items.nth(own[position]).click(timeout=5000)
         page.wait_for_timeout(200)
-        if label.count() == 0 or label.inner_text().strip() == wanted:
+        label = _own_dropdown_part(page, blank_index, '[data-qa="MenuButtonLabel"]')
+        if label is None or label.inner_text().strip() == wanted:
             return True
     return False
 
@@ -1786,7 +1842,11 @@ def get_revealed_answer(page, exercise):
                 for (let i = 1; ; i++) {
                     const el = document.querySelector(`[data-qa="ClozeDropdown_${i}"]`);
                     if (!el) break;
-                    const label = el.querySelector('[data-qa="MenuButtonLabel"]');
+                    // Con los desplegables ANIDADOS, el primer
+                    // MenuButtonLabel de dentro puede ser el de OTRO
+                    // espacio: se filtra por su dueño real.
+                    const label = Array.from(el.querySelectorAll('[data-qa="MenuButtonLabel"]'))
+                        .find((candidate) => candidate.closest('[data-qa^="ClozeDropdown_"]') === el);
                     out.push(label ? label.textContent.trim() : '');
                 }
                 return out;
