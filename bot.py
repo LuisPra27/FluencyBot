@@ -1651,6 +1651,17 @@ MAX_RESTARTS = 30
 
 if __name__ == "__main__":
     _start_logging()
+
+    # Que el modelo exista se comprueba ANTES de abrir el navegador: si
+    # NVIDIA lo dio de baja (ya pasó con muse-glimmer-30b), reintentar no
+    # arregla nada y el bot se pasaría la noche respondiendo a ciegas,
+    # cerrando todo por revelación en vez de acertando.
+    models_ok, models_message = ai.check_models()
+    print(f"IA: {models_message}")
+    if not models_ok:
+        print("No se arranca: sin modelo no hay forma de resolver nada.")
+        raise SystemExit(1)
+
     for attempt in range(1, MAX_RESTARTS + 1):
         print(f"=== Intento {attempt}/{MAX_RESTARTS} ===")
         if main():

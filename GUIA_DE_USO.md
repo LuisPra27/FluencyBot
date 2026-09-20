@@ -202,6 +202,82 @@ revisarlo: en el log aparecen los errores de la API tal cual.
 
 ---
 
+## 9b. Si el modelo de IA deja de funcionar
+
+Es el problema más probable a medio plazo: **NVIDIA da de baja modelos sin
+avisar**. Ya pasó una vez con `muse-glimmer-30b`, que empezó a devolver 404
+de un día para otro.
+
+Hay tres redes de seguridad, en este orden:
+
+1. **Al arrancar**, el bot comprueba que el modelo existe y lo dice en la
+   primera línea del log:
+
+   ```
+   IA: modelo 'meta/llama-3.2-11b-vision-instruct' disponible
+   ```
+
+   Si ya no existe, no arranca (en vez de pasarse la noche respondiendo a
+   ciegas) y te dice qué hacer.
+
+2. **A mitad de corrida**, si desaparece, cambia solo a un sustituto y lo
+   deja escrito en el log:
+
+   ```
+   !!! El modelo 'X' ya no existe; cambio a 'Y' para el resto de la corrida.
+   ```
+
+3. **A mano**, que es lo que querrás si ninguno de los sustitutos sirve.
+   Pide la lista de lo que hay disponible ahora mismo:
+
+   ```powershell
+   .\venv\Scripts\python.exe ai.py
+   ```
+
+   Te imprime algo así, **probando cada candidato con una llamada real**:
+
+   ```
+   == Lo que hay configurado ahora en ai.py ==
+     MODEL        meta/llama-3.2-11b-vision-instruct      disponible
+     AUDIO_MODEL  nvidia/nemotron-3-nano-omni-30b-...     disponible
+
+   == Sustitutos para MODEL, probados ahora mismo ==
+     [RESPONDE]  meta/llama-3.2-11b-vision-instruct  (entiende imágenes)
+     [RESPONDE]  nvidia/nemotron-3-super-120b-a12b
+     [RESPONDE]  openai/gpt-oss-20b
+     ...
+   ```
+
+   Coge uno que diga `[RESPONDE]`, abre `ai.py` y pégalo en la línea
+   correspondiente de arriba del todo:
+
+   ```python
+   MODEL = "nvidia/nemotron-3-super-120b-a12b"
+   AUDIO_MODEL = "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"
+   ```
+
+   Si ninguno de esos responde, prueba el catálogo entero (tarda unos
+   minutos, son más de 80 modelos):
+
+   ```powershell
+   .\venv\Scripts\python.exe ai.py todos
+   ```
+
+> **Por qué se prueban en vez de fiarse de la lista:** que un modelo
+> aparezca en el catálogo de NVIDIA **no significa que funcione**. Probados
+> los 82 ids el 2026-09-20, la mayoría devolvía error 404 al usarlos de
+> verdad y algunos se quedaban colgados. Solo respondían cinco.
+>
+> **`MODEL` debería entender imágenes** (hay ejercicios de emparejar con
+> fotos). Si eliges uno de solo texto, esos se responderán a ciegas y todo
+> lo demás seguirá funcionando igual.
+
+> Si te quedas sin modelo de audio no se rompe nada: esos ejercicios pasan a
+> responderse a ciegas hasta que Rosetta enseña la respuesta, el bot se la
+> guarda y la coloca en la siguiente pasada.
+
+---
+
 ## 10. Si quieres compartirlo
 
 El repositorio ya ignora todo lo personal (`.env`, los `.json` de estado,

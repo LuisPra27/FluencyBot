@@ -8,12 +8,20 @@ son solo audio (sin texto legible) se usa
 nvidia/nemotron-3-nano-omni-30b-a3b-reasoning, que sí entiende audio (el
 modelo principal no).
 
-NOTA: el modelo principal era antes meta/muse-glimmer-30b, dado de baja por
-NVIDIA sin aviso entre sesiones — empezó a devolver 404 en cualquier llamada
-de un día para otro (confirmado en vivo: seguía apareciendo en
-`_client.models.list()` pero la inferencia fallaba). Si este modelo también
-deja de funcionar en el futuro, revisar `_client.models.list()` para ver
-qué sigue disponible antes de asumir que es un bug del código.
+LOS MODELOS DE NVIDIA VAN Y VIENEN. El principal era antes
+meta/muse-glimmer-30b y un día empezó a devolver 404 en toda llamada, sin
+aviso (comprobado el 2026-09-20: hoy vuelve a estar en el catálogo y
+responde, así que la baja fue temporal o se revirtió — no dar por hecho
+que un id muerto lo esté para siempre, ni al revés).
+
+Por eso, tres cosas:
+
+* `check_models()` comprueba al arrancar que el modelo sigue vivo, en vez
+  de descubrirlo ejercicio a ejercicio.
+* Si desaparece a mitad de una corrida, `_ask_json()` cambia solo a un
+  sustituto que esté DE VERDAD en el catálogo (FALLBACK_MODELS).
+* `python ai.py` imprime el catálogo vivo ordenado por lo que sirve para
+  cada papel, para elegir uno a mano y pegarlo aquí arriba.
 """
 
 import json
@@ -28,7 +36,110 @@ import config
 MODEL = "meta/llama-3.2-11b-vision-instruct"
 AUDIO_MODEL = "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"
 
-_client = OpenAI(base_url="https://integrate.api.nvidia.com/v1", api_key=config.AI_API_KEY)
+# Sustitutos por si NVIDIA da de baja el modelo en uso, en orden de
+# preferencia.
+#
+# APARECER EN EL CATÁLOGO NO SIGNIFICA QUE FUNCIONE. Probados los 82 ids de
+# `models.list()` el 2026-09-20 con una llamada real: la mayoría devuelve
+# 404 en la inferencia (fuyu-8b, kosmos-2, vila, neva-22b, gemma-3-12b-it,
+# llama-3.1-nemotron-70b...) y otros se cuelgan hasta el timeout
+# (llama-3.2-90b-vision-instruct, kimi-k3, mistral-nemotron). Por eso esta
+# lista es solo de los que CONTESTARON, y aun así `_replacement_for()` los
+# vuelve a probar antes de adoptar ninguno.
+#
+# Solo el primero entiende imágenes; los demás son de texto. Si hay que
+# caer en uno de texto, los emparejamientos con fotos se responderán a
+# ciegas (el bot ya sabe degradar así), pero todo lo demás sigue igual.
+FALLBACK_MODELS = [
+    "meta/llama-3.2-11b-vision-instruct",
+    "nvidia/nemotron-3-super-120b-a12b",
+    "openai/gpt-oss-20b",
+    "z-ai/glm-5.3",
+    "meta/muse-glimmer-30b",
+]
+# El de audio es el ÚNICO del catálogo que entiende audio (2026-09-20); los
+# otros dos son apuestas por si aparecen. Ojo: este modelo responde con
+# error 500 a una pregunta de solo texto, así que NO sirve probarlo con un
+# "di OK" — solo se le puede comprobar con audio de verdad. Si se cae, los
+# ejercicios de solo-audio pasan a responderse a ciegas hasta llegar a la
+# respuesta revelada, que es la degradación que ya sabe manejar el bot.
+FALLBACK_AUDIO_MODELS = [
+    "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
+    "microsoft/phi-4-multimodal-instruct",
+    "google/gemma-3-27b-it",
+]
+
+# max_retries=1: por defecto el SDK reintenta 2 veces, así que un modelo
+# colgado tardaba TRES veces el timeout (medido: 25 s de tope = 62,6 s
+# reales). Con AI_TIMEOUT_S=90 eso son 4 minutos y medio en un solo
+# ejercicio. Se deja un reintento para los fallos pasajeros, no tres.
+_client = OpenAI(
+    base_url="https://integrate.api.nvidia.com/v1",
+    api_key=config.AI_API_KEY,
+    max_retries=1,
+)
+
+# Modelos dados de baja durante esta corrida y por cuál se cambiaron.
+_REPLACEMENTS = {}
+
+
+def _model_is_missing(error):
+    """
+    True si el error es "ese modelo ya no existe" y no otra cosa (la clave,
+    la cuota, la red). Confirmado en vivo con muse-glimmer-30b: 404 en toda
+    llamada, aunque el modelo SEGUÍA apareciendo en models.list().
+    """
+    if getattr(error, "status_code", None) == 404:
+        return True
+    text = str(error).lower()
+    return "404" in text and ("model" in text or "not found" in text)
+
+
+def _answers(model, timeout_s=25):
+    """
+    True si el modelo contesta de verdad a una pregunta mínima. Hace falta
+    porque estar en el catálogo no basta: de los 82 ids que devolvía
+    `models.list()` el 2026-09-20, la mayoría daba 404 al intentar usarlos
+    y algunos se colgaban. Sin esta comprobación, el cambio automático
+    elegiría un modelo muerto y todo seguiría fallando, pero con otro
+    nombre.
+    """
+    try:
+        _client.with_options(max_retries=0, timeout=timeout_s).chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": "Di OK"}],
+            max_tokens=8,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def _replacement_for(model):
+    """
+    Busca un sustituto para un modelo dado de baja y lo PRUEBA antes de
+    devolverlo. Devuelve None si ninguno responde: mejor decirlo claro que
+    cambiar a otro modelo igual de muerto.
+
+    Para el modelo de audio no se prueba nada: contesta con error 500 a las
+    preguntas de solo texto, así que la prueba daría un falso negativo.
+    """
+    pool = FALLBACK_AUDIO_MODELS if model in FALLBACK_AUDIO_MODELS else FALLBACK_MODELS
+    is_audio = pool is FALLBACK_AUDIO_MODELS
+
+    try:
+        catalog = {m.id for m in _client.models.list().data}
+    except Exception:
+        catalog = None  # sin catálogo se prueba igual: la prueba manda
+
+    for candidate in pool:
+        if candidate == model or candidate in _REPLACEMENTS.values():
+            continue
+        if catalog is not None and candidate not in catalog:
+            continue
+        if is_audio or _answers(candidate):
+            return candidate
+    return None
 
 # Tope por llamada a la IA. Confirmado en vivo que el modelo de audio (que
 # razona antes de responder) puede tardar más de 5 minutos en UNA respuesta,
@@ -38,18 +149,163 @@ _client = OpenAI(base_url="https://integrate.api.nvidia.com/v1", api_key=config.
 AI_TIMEOUT_S = 90
 
 
-def _ask_json(content, max_tokens=3000, model=MODEL):
-    """
-    Llama al modelo y parsea su respuesta como JSON. El modelo razona antes
-    de responder (consume tokens en eso), por lo que max_tokens debe dejar
-    margen suficiente para el razonamiento + la respuesta final.
-    """
-    response = _client.chat.completions.create(
+def _call_model(model, content, max_tokens):
+    """La llamada pelada, sin nada de lo demás (reintentos, parseo)."""
+    return _client.chat.completions.create(
         model=model,
         messages=[{"role": "user", "content": content}],
         max_tokens=max_tokens,
         timeout=AI_TIMEOUT_S,
     )
+
+
+def check_models():
+    """
+    Comprueba ANTES de empezar que el modelo principal sigue existiendo, y
+    lo cambia por un sustituto si no. Devuelve (ok, mensaje) para que quien
+    llama decida: un modelo dado de baja no se arregla reintentando, así
+    que más vale pararse y decirlo que gastar la noche adivinando.
+
+    Un fallo que NO sea "modelo inexistente" (red, clave, cuota) se da por
+    bueno: puede ser pasajero y no es motivo para no arrancar.
+    """
+    model = _REPLACEMENTS.get(MODEL, MODEL)
+    try:
+        _call_model(model, "Responde solo con la palabra OK.", 16)
+        return True, f"modelo '{model}' disponible"
+    except Exception as error:
+        if not _model_is_missing(error):
+            return True, f"no se pudo comprobar el modelo ({str(error)[:120]}); sigo igual"
+        replacement = _replacement_for(model)
+        if replacement is None:
+            return False, (
+                f"NVIDIA dio de baja el modelo '{model}' y ninguno de los sustitutos previstos "
+                "está disponible. Hay que elegir uno nuevo en ai.py (MODEL) mirando "
+                "build.nvidia.com o _client.models.list()."
+            )
+        _REPLACEMENTS[model] = replacement
+        return True, f"el modelo '{model}' ya no existe; se usará '{replacement}'"
+
+
+# Pistas para clasificar el catálogo por el NOMBRE. Es una heurística, no
+# un dato de la API: NVIDIA solo devuelve el id, la fecha y el dueño. Sirve
+# para ordenar la lista que se le enseña a la persona, que es quien decide.
+_IMAGE_HINTS = ("vision", "-vl", "vlm", "omni", "multimodal", "neva", "vila", "kosmos", "fuyu")
+_AUDIO_HINTS = ("omni", "audio", "speech", "voice", "multimodal")
+_NOT_USABLE_HINTS = (
+    "embed", "guard", "safety", "reward", "retriev", "rerank", "parse",
+    "nvclip", "translate", "detector", "code", "starcoder", "diffusion",
+)
+
+
+def list_models():
+    """
+    Devuelve (configurados, para_imagenes, para_audio, resto) leyendo el
+    catálogo VIVO de NVIDIA, para que quien use el bot pueda elegir un
+    modelo nuevo si el actual deja de funcionar.
+
+    `configurados` es una lista de (rol, id, estado) donde estado dice si
+    el modelo sigue en el catálogo y si tiene fecha de baja anunciada
+    (campo `shutdown_date`, que la API sí da).
+    """
+    catalog = {m.id: m for m in _client.models.list().data}
+
+    configured = []
+    for role, model in (("MODEL", MODEL), ("AUDIO_MODEL", AUDIO_MODEL)):
+        entry = catalog.get(model)
+        if entry is None:
+            state = "YA NO ESTÁ EN EL CATÁLOGO — hay que cambiarlo"
+        elif getattr(entry, "shutdown_date", None):
+            state = f"se da de baja el {entry.shutdown_date} — conviene cambiarlo antes"
+        else:
+            state = "disponible"
+        configured.append((role, model, state))
+
+    usable = [
+        i for i in sorted(catalog)
+        if not any(h in i.lower() for h in _NOT_USABLE_HINTS)
+    ]
+    for_images = [i for i in usable if any(h in i.lower() for h in _IMAGE_HINTS)]
+    for_audio = [i for i in usable if any(h in i.lower() for h in _AUDIO_HINTS)]
+    rest = [i for i in usable if i not in for_images and i not in for_audio]
+    return configured, for_images, for_audio, rest
+
+
+def print_models(probe_all=False):
+    """
+    Imprime qué modelos se pueden usar, para elegir uno a mano y pegarlo en
+    MODEL / AUDIO_MODEL (ver `python ai.py`).
+
+    Los de la lista corta se PRUEBAN con una llamada real, porque estar en
+    el catálogo no significa que funcionen: la mayoría de los 82 ids que
+    devuelve la API dan 404 al usarlos. Con `probe_all=True` se prueba el
+    catálogo entero (tarda unos minutos), que es lo que hace falta el día
+    que no funcione ninguno de los previstos.
+    """
+    configured, for_images, for_audio, rest = list_models()
+
+    print("== Lo que hay configurado ahora en ai.py ==")
+    for role, model, state in configured:
+        print(f"  {role:12} {model:48} {state}")
+
+    print()
+    print("== Sustitutos para MODEL, probados ahora mismo ==")
+    for model in FALLBACK_MODELS:
+        mark = "RESPONDE" if _answers(model, timeout_s=20) else "no sirve"
+        note = "  (entiende imágenes)" if "vision" in model else ""
+        print(f"  [{mark}]  {model}{note}")
+
+    print()
+    print("== Para AUDIO_MODEL (tiene que entender AUDIO) ==")
+    print("  No se pueden probar con texto: contestan error 500 si no les mandas audio.")
+    for model in FALLBACK_AUDIO_MODELS:
+        print(f"  [{'en el catálogo' if model in for_audio else 'no está'}]  {model}")
+
+    if probe_all:
+        print()
+        print("== Probando el catálogo entero (esto tarda) ==")
+        for model in sorted(set(for_images + for_audio + rest)):
+            if _answers(model, timeout_s=15):
+                print(f"  [RESPONDE]  {model}")
+    else:
+        print()
+        print(f"== Resto del catálogo ({len(rest) + len(for_images) - 1} ids más, sin probar) ==")
+        print("  Ojo: la mayoría da 404 al usarlos aunque aparezcan aquí.")
+        print("  Para probarlos uno a uno:  python ai.py todos")
+
+    print()
+    print("Para cambiarlo: edita MODEL o AUDIO_MODEL al principio de ai.py y pega el id tal cual.")
+    print("MODEL debería entender imágenes (hay ejercicios de emparejar con fotos); si el que")
+    print("eliges es solo de texto, esos se responderán a ciegas y el resto seguirá igual.")
+
+
+def _ask_json(content, max_tokens=3000, model=MODEL):
+    """
+    Llama al modelo y parsea su respuesta como JSON. El modelo razona antes
+    de responder (consume tokens en eso), por lo que max_tokens debe dejar
+    margen suficiente para el razonamiento + la respuesta final.
+
+    Si NVIDIA dio de baja el modelo (404), se cambia a un sustituto del
+    catálogo vivo y se reintenta UNA vez. Sin esto, un apagón como el de
+    muse-glimmer-30b deja al bot toda la noche respondiendo a ciegas sin
+    que nada lo avise (cada 404 se ve en el log igual que una respuesta
+    mal formada de la IA).
+    """
+    model = _REPLACEMENTS.get(model, model)
+    try:
+        response = _call_model(model, content, max_tokens)
+    except Exception as error:
+        if not _model_is_missing(error):
+            raise
+        replacement = _replacement_for(model)
+        if replacement is None:
+            raise RuntimeError(
+                f"NVIDIA dio de baja el modelo '{model}' y no hay sustituto disponible. "
+                "Revisar los ids de ai.py contra build.nvidia.com."
+            ) from error
+        print(f"!!! El modelo '{model}' ya no existe; cambio a '{replacement}' para el resto de la corrida.")
+        _REPLACEMENTS[model] = replacement
+        response = _call_model(replacement, content, max_tokens)
     message = response.choices[0].message
 
     reasoning = getattr(message, "reasoning_content", None)
@@ -606,3 +862,14 @@ def solve_exercise(exercise_data: dict, previous_attempts: list | None = None) -
         return _solve_matching_audio_options(exercise_data, previous_attempts)
 
     raise NotImplementedError(f"ai.solve_exercise no soporta el tipo '{exercise_type}'")
+
+
+if __name__ == "__main__":
+    # `python ai.py` enseña qué modelos se pueden usar ahora mismo, para
+    # poder reemplazar a mano el que se caiga. Los ids de NVIDIA cambian
+    # con el tiempo, así que una lista escrita en el README envejece; esta
+    # se lee del catálogo en vivo y se comprueba con llamadas reales.
+    # `python ai.py todos` prueba el catálogo entero (tarda unos minutos).
+    import sys
+
+    print_models(probe_all="todos" in sys.argv[1:])
