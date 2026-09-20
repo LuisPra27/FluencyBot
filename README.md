@@ -509,6 +509,32 @@ locator.click()
 
 * [x] **Log de cada corrida en `logs/bot_<fecha>_<hora>.log`.** Copia de TODO lo que sale por consola —mensajes del bot, razonamiento de la IA y tracebacks de errores— con la hora al principio de cada línea (solo en el archivo; la consola se ve igual). Se hace duplicando stdout/stderr (`bot._Tee`), no cambiando cada `print()`, para que no se escape nada. Se vacía al disco en cada escritura: con la salida en buffer, detener el bot a mano perdía el log entero justo cuando más falta hacía. Solo se activa al ejecutar `bot.py`, no al importarlo, para que los scripts de prueba no vayan dejando logs.
 
+### Lo que destapó correr el bot leyendo su log (2026-09-20)
+
+* [x] **Una "Prueba" quedaba `Omitida` aunque el bot contestara bien.** Los
+  `ClozeDropdown_N` pueden venir **anidados**: se confirmó en vivo un
+  `ClozeDropdown_1` que contenía dentro los menús de los otros dos
+  espacios. Buscar el botón "dentro" del contenedor devolvía 3 y Playwright
+  se negaba a actuar ("strict mode violation"); la excepción abortaba la
+  ACTIVIDAD ENTERA, tirando a la basura las tres preguntas que ya estaban
+  correctas (`multiple_choice`, `sentence_build`, `multiple_choice`) y
+  dejando la actividad omitida. Peor todavía, `get_cloze_options()` fallaba
+  en silencio por lo mismo: como opciones del espacio 1 leía también las de
+  los espacios 2 y 3, así que la IA elegía sobre una lista contaminada sin
+  que nada diera error. Ahora cada botón, opción y etiqueta se filtra por
+  el `ClozeDropdown` que de verdad lo contiene (`closest`), funcione
+  anidado o no (`browser._own_dropdown_indices`).
+* [x] **Un error de UNA actividad ya no reinicia la corrida entera.**
+  `work_pending_activities()` solo atrapaba `PlaywrightTimeoutError`;
+  cualquier otro error (como el de arriba) subía hasta `main()`. Ahora se
+  registra y se sigue con la siguiente actividad.
+* [x] **El número de cursos no está escrito en el código.** `get_courses()`
+  cuenta las tarjetas que haya en "Mis cursos" en ese momento y
+  `find_next_lesson()` recorre esas, así que el "31" de este README es solo
+  el registro de una corrida, no un límite. Comprobado en vivo (2026-09-20)
+  volcando el DOM de la pantalla: 31 `CourseDisplayerDiv`, 31
+  `LaunchCourseButton`, una sola pestaña ("B1").
+
 ### Lo que destapó correr el bot leyendo su log (2026-09-19)
 
 * [x] **"Lectura en voz alta" en el panel lateral hacía omitir TODAS las actividades de la lección.** `has_read_aloud_activity()` buscaba ese texto en toda la página, y también es el nombre de otra actividad en el panel lateral. En una opción múltiple normal devolvía True (confirmado con el DOM real), y `work_pending_activities()` lo mira antes que el ejercicio. Era la causa principal de las lecciones bloqueadas con pendientes que el bot sí sabe resolver. Ahora ignora el panel lateral.
