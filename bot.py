@@ -187,6 +187,11 @@ def _mark_blocked(blocked, key, reason, pending=(), lesson_path=None, count_fail
         "failures": failures,
         "pending": sorted({a["type"] for a in pending}),
         "lesson_path": lesson_path or previous.get("lesson_path"),
+        # Cuántas veces se ha reabierto ya esta lección SOLO para colocar
+        # respuestas guardadas (ver _permanently_blocked_keys): si se
+        # perdiera aquí, esa cuenta volvería a cero en cada visita y una
+        # respuesta imposible de colocar la reabriría para siempre.
+        "redos": previous.get("redos", 0),
     }
     _save_blocked_lessons(blocked)
     return blocked[key]
@@ -201,24 +206,42 @@ def _permanently_blocked_keys(blocked, known_answers=None):
     cuesta una navegación y cero llamadas a la IA, mucho menos que dejar
     lecciones perfectamente resolubles marcadas para siempre.
 
-    Excepción al tope de fallos: si hay respuestas guardadas para esa
-    lección que todavía no se usaron, se vuelve a intentar igual. Tener la
-    respuesta a mano y no usarla es exactamente lo que no puede pasar.
+    Excepción, por ENCIMA de cualquier motivo: si hay respuestas guardadas
+    para esa lección que todavía no se usaron, se vuelve a intentar igual.
+    Tener la respuesta a mano y no usarla es exactamente lo que no puede
+    pasar — y sí pasaba: una lección cuya única pega era una actividad
+    "Completa" (terminada sin acertar, con su respuesta ya aprendida)
+    quedaba marcada "solo queda voz" y no se volvía a abrir nunca. Al
+    reabrirla, redo_completed_with_answers() las coloca.
+
+    El tope de `redos` evita el bucle contrario: una respuesta que por lo
+    que sea nunca se logra colocar reabriría la lección en todas las
+    corridas para siempre.
     """
     if known_answers is None:
         known_answers = _load_known_answers()
     answer_keys = list(known_answers)
 
-    def has_unused_answers(state):
-        path = state.get("lesson_path")
-        return bool(path) and any(k.startswith(path + "/") for k in answer_keys)
-
     return {
         key
         for key, state in blocked.items()
-        if state.get("reason") in (BLOCKED_SPEECH, BLOCKED_DONE)
-        or (state.get("failures", 0) >= MAX_LESSON_FAILURES and not has_unused_answers(state))
+        if not _has_unused_answers(state, answer_keys)
+        and (
+            state.get("reason") in (BLOCKED_SPEECH, BLOCKED_DONE)
+            or state.get("failures", 0) >= MAX_LESSON_FAILURES
+        )
     }
+
+
+def _has_unused_answers(state, answer_keys):
+    """
+    True si quedan respuestas guardadas de esa lección sin colocar (y
+    todavía no se ha gastado el cupo de reaperturas para intentarlo).
+    """
+    path = state.get("lesson_path")
+    if not path or state.get("redos", 0) >= MAX_LESSON_FAILURES:
+        return False
+    return any(k.startswith(path + "/") for k in answer_keys)
 
 
 def _load_speech_ids():
@@ -722,7 +745,12 @@ def _work_single_activity(page, activity):
             page.wait_for_timeout(500)
             continue
 
-        if browser.requires_speech(page):
+        # El micrófono NO manda si la pantalla se puede pasar página a
+        # página: en "Vocabulario" hablar es opcional y basta con ver todas
+        # las palabras para que cuente como Completa. Antes ganaba esta
+        # rama, la actividad quedaba fichada como de voz y ni se abría en
+        # las siguientes corridas.
+        if browser.requires_speech(page) and not browser.has_paginated_content(page):
             _remember_speech_activity(activity["id"])
             print(f"  '{activity['type']}': la pantalla exige hablar (botón de micrófono); se omite a propósito.")
             _click_advance(page)
@@ -929,6 +957,85 @@ def work_pending_activities(page, lesson_title):
     return fixed
 
 
+def redo_completed_with_answers(page, lesson_title, lesson_path):
+    """
+    Reabre las actividades que quedaron "Completa" y de las que hay
+    respuesta guardada, para contestarlas de verdad y que pasen a
+    "Correcta". Debe llamarse estando en el resumen.
+
+    "Completa" es terminada pero con algo sin acertar: casi siempre una
+    pregunta que se cerró porque Rosetta enseñó la respuesta, lo que NO da
+    crédito. El bot guarda esa respuesta para reusarla, pero
+    get_pending_activities() no devuelve las "Completa", así que las rondas
+    de reintento no volvían a abrirlas y lo aprendido se quedaba sin usar
+    para siempre: confirmado en vivo, 12 respuestas guardadas en 8
+    lecciones que ya estaban dadas por cerradas, incluida una Prueba que
+    acababa de aprender 3 en la misma visita.
+
+    A qué actividad pertenece cada respuesta se sabe por su clave
+    (`course/<curso>/<lección>/<actividad>/<paso>`), pero ese número solo
+    se puede confirmar con la actividad ya abierta (la URL), así que se
+    prueban primero las que están en esa posición del panel y se para en
+    cuanto no queda ninguna respuesta por colocar.
+    """
+    if not lesson_path:
+        return 0
+
+    prefix = lesson_path + "/"
+    wanted = {key[len(prefix):].split("/")[0] for key in _load_known_answers() if key.startswith(prefix)}
+    if not wanted:
+        return 0
+
+    speech_ids = _load_speech_ids()
+    candidates = [
+        a for a in browser.get_completed_activities(page)
+        if not browser.is_speech_activity(a, speech_ids)
+    ]
+    if not candidates:
+        return 0
+
+    candidates.sort(key=lambda a: 0 if str(a["position"]) in wanted else 1)
+    print(
+        f"'{lesson_title}': {len(wanted)} respuesta(s) guardada(s) de actividades que quedaron "
+        "'Completa' (terminadas sin acertar); las reabro para dejarlas 'Correcta'..."
+    )
+
+    fixed = 0
+    for activity in candidates:
+        if not wanted:
+            break
+        try:
+            browser.open_activity(page, activity)
+        except Exception as e:
+            print(f"  No se pudo reabrir '{activity['type']}': {str(e).splitlines()[0][:120]}; sigo.")
+            continue
+
+        if not _wait_for_activity_screen(page):
+            browser.go_to_lesson_summary(page)
+            continue
+
+        key = browser.get_exercise_key(page)
+        index = key[len(prefix):].split("/")[0] if key and key.startswith(prefix) else None
+        if index not in wanted:
+            # No es una de las que tienen respuesta guardada: cerrar sin
+            # tocar nada. Reabrir una actividad ya cerrada y dejarla a
+            # medias podría empeorarla.
+            browser.go_to_lesson_summary(page)
+            continue
+
+        wanted.discard(index)
+        try:
+            if _work_single_activity(page, activity):
+                fixed += 1
+        except Exception as e:
+            print(f"  '{activity['type']}': error inesperado ({str(e).splitlines()[0][:120]}); sigo.")
+            _debug_screenshot_omit(page, activity["type"])
+        browser.go_to_lesson_summary(page)
+
+    print(f"'{lesson_title}': {fixed} actividad(es) 'Completa' respondidas de memoria.")
+    return fixed
+
+
 def run_lesson(page, lesson_title, already_completed=0, max_skips=MAX_SKIPS):
     """
     Resuelve ejercicios de la lección actual uno tras otro. Las pantallas
@@ -1025,7 +1132,9 @@ def run_lesson(page, lesson_title, already_completed=0, max_skips=MAX_SKIPS):
 
         # Pantalla que exige hablar (botón de micrófono), aunque su tipo no
         # lo diga: se omite a propósito, igual que la lectura en voz alta.
-        if browser.requires_speech(page):
+        # Salvo que se pueda pasar página a página (Vocabulario): ahí hablar
+        # es opcional y se cierra viendo todas las palabras.
+        if browser.requires_speech(page) and not browser.has_paginated_content(page):
             skips += 1
             if skips > max_skips:
                 break
@@ -1231,6 +1340,13 @@ def run_lesson(page, lesson_title, already_completed=0, max_skips=MAX_SKIPS):
         if learned:
             print(f"'{lesson_title}': se aprendieron {len(learned)} respuesta(s) nueva(s); otra pasada para usarlas.")
 
+    # Antes del veredicto: las actividades que quedaron "Completa" (o sea,
+    # terminadas sin acertar) de las que ya hay respuesta guardada se
+    # reabren para responderlas de verdad. No entran en las rondas de
+    # arriba porque get_pending_activities() no las da por pendientes.
+    if browser.go_to_lesson_summary(page):
+        redo_completed_with_answers(page, lesson_title, browser.get_lesson_path(page))
+
     # Veredicto real de la lección, leído del panel lateral y no del
     # contador: el contador sube igual esté bien o mal, así que no sirve
     # para saber si algo quedó "Omitida"/"Vuelva a intentarlo".
@@ -1372,6 +1488,15 @@ def main():
                 _SESSION_ATTEMPTED.add(key)
                 lesson_path = browser.get_lesson_path(page)
                 answers_before = set(_load_known_answers())
+
+                # Si esta lección ya estaba dada por cerrada y se reabre
+                # SOLO para colocar respuestas guardadas, se cuenta el
+                # intento: si nunca se logran colocar, deja de reabrirse al
+                # llegar al tope (ver _permanently_blocked_keys).
+                previous_state = blocked.get(key)
+                if previous_state and _has_unused_answers(previous_state, answers_before):
+                    previous_state["redos"] = previous_state.get("redos", 0) + 1
+                    _save_blocked_lessons(blocked)
                 try:
                     result, pending = run_lesson(page, lesson_title, already_completed=already_completed)
                 except PlaywrightTimeoutError as e:

@@ -314,6 +314,14 @@ SPEECH_ACTIVITY_TYPES = {
     "Habla",
 }
 
+# Tipos que SIEMPRE se pueden cerrar sin hablar, aunque su pantalla tenga
+# botón de micrófono. En "Vocabulario" hablar es opcional: basta con ver
+# todas las palabras (pasar sus páginas) para que Rosetta la cuente como
+# Completa. Sin esta excepción, el detector de micrófono las metía en
+# speech_activities.json y el bot las omitía sin abrirlas siquiera, dejando
+# lecciones enteras bloqueadas "por voz" que en realidad se podían cerrar.
+PAGEABLE_ACTIVITY_TYPES = {"Vocabulario"}
+
 # Textos de estado que significan "esta actividad ya quedó bien de verdad".
 # "Completa" es de contenido no evaluado (Demostración, Vocabulario,
 # Explicación); "Correcta" es de un ejercicio evaluado respondido bien.
@@ -410,7 +418,12 @@ def is_speech_activity(activity, speech_ids=()):
     porque hay actividades de voz con nombre de tipo engañoso: confirmado en
     vivo, "Llene los espacios en blanco" puede ser "Seleccione la mejor
     respuesta y diga la oración completa", que no se puede enviar sin hablar.
+
+    Excepción: los tipos de PAGEABLE_ACTIVITY_TYPES nunca son de voz por
+    mucho micrófono que tengan en pantalla.
     """
+    if activity["type"] in PAGEABLE_ACTIVITY_TYPES:
+        return False
     return activity["type"] in SPEECH_ACTIVITY_TYPES or activity["id"] in speech_ids
 
 
@@ -486,6 +499,19 @@ def get_flagged_activity_ids(page):
         if a["id"] not in _NON_ACTIVITY_IDS
         and a["status"] in ("Omitida", "Vuelva a intentarlo")
     ]
+
+
+def get_completed_activities(page):
+    """
+    Debe estar en el resumen. Actividades que el panel marca "Completa"
+    pero NO "Correcta": están terminadas, pero algo de dentro no se acertó
+    —típicamente una pregunta que se cerró porque Rosetta acabó enseñando
+    la respuesta, cosa que no da crédito—. Cada una lleva su `position`
+    (1-based) entre las actividades de la lección, que es el número que
+    usa la URL (`…/<lección>/<actividad>/<paso>`).
+    """
+    activities = [a for a in get_activity_statuses(page) if a["id"] not in _NON_ACTIVITY_IDS]
+    return [dict(a, position=i + 1) for i, a in enumerate(activities) if a["status"] == "Completa"]
 
 
 def open_activity(page, activity):
