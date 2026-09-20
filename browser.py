@@ -1332,17 +1332,26 @@ def drag_matching_pair(page, word, target_index):
     word_locator = page.locator('[data-qa="DragDropText"]').filter(has_text=word).first
     target_locator = page.locator('[data-qa="MatchingDropTarget"]').nth(target_index - 1)
 
-    word_box = word_locator.bounding_box()
-    target_box = target_locator.bounding_box()
+    # Timeout corto: si la palabra ya no está abajo (por ejemplo porque la
+    # IA repitió una que ya se colocó), bounding_box() se quedaba esperando
+    # 30 s por un elemento que no va a aparecer.
+    word_box = word_locator.bounding_box(timeout=5000)
+    target_box = target_locator.bounding_box(timeout=5000)
+    if not word_box or not target_box:
+        return False
 
-    page.mouse.move(word_box["x"] + word_box["width"] / 2, word_box["y"] + word_box["height"] / 2)
-    page.mouse.down()
-    page.mouse.move(
-        target_box["x"] + target_box["width"] / 2,
-        target_box["y"] + target_box["height"] / 2,
-        steps=10,
-    )
-    page.mouse.up()
+    # Todo el ejercicio tiene que caber en pantalla o el ratón no puede
+    # soltar donde debe (ver fit_exercise_in_viewport).
+    original = fit_exercise_in_viewport(page)
+    try:
+        word_box = word_locator.bounding_box(timeout=5000)
+        target_box = target_locator.bounding_box(timeout=5000)
+        if not word_box or not target_box:
+            return False
+        _drag_to(page, word_locator, target_locator)
+        return True
+    finally:
+        restore_viewport(page, original)
 
 
 def get_ordering_items(page):
@@ -1703,6 +1712,13 @@ def get_revealed_answer(page, exercise):
         if not index:
             return None
         solution = {"answer": index}
+        # Rosetta baraja las opciones en cada apertura, también las de
+        # TEXTO (confirmado en vivo: dos respuestas guardadas por posición
+        # fallaron y al revelarlas salieron en otro sitio). El texto de la
+        # opción sí es estable, así que se guarda cuando lo hay.
+        options = exercise.get("options") or []
+        if len(options) >= index and options[index - 1]:
+            solution["answer_text"] = options[index - 1]
         ids = exercise.get("option_audio_ids") or []
         if len(ids) >= index and ids[index - 1]:
             # Opciones de solo audio: se barajan al reabrir, así que se

@@ -614,11 +614,20 @@ def _locate_remembered(exercise, remembered):
     audio_id = remembered.get("answer_audio_id")
     ids = exercise.get("option_audio_ids") or []
     if audio_id and audio_id in ids:
-        now = ids.index(audio_id) + 1
-        if now != remembered.get("answer"):
-            print(f"  (las opciones se barajaron: la correcta pasó de la posición {remembered.get('answer')} a la {now})")
-        return {**remembered, "answer": now}
+        return _with_position(remembered, ids.index(audio_id) + 1)
+
+    answer_text = remembered.get("answer_text")
+    options = exercise.get("options") or []
+    if answer_text and answer_text in options:
+        return _with_position(remembered, options.index(answer_text) + 1)
+
     return remembered
+
+
+def _with_position(remembered, position):
+    if position != remembered.get("answer"):
+        print(f"  (las opciones se barajaron: la correcta pasó de la posición {remembered.get('answer')} a la {position})")
+    return {**remembered, "answer": position}
 
 
 def _capture_revealed_and_advance(page, exercise, key):
