@@ -509,6 +509,44 @@ locator.click()
 
 * [x] **Log de cada corrida en `logs/bot_<fecha>_<hora>.log`.** Copia de TODO lo que sale por consola —mensajes del bot, razonamiento de la IA y tracebacks de errores— con la hora al principio de cada línea (solo en el archivo; la consola se ve igual). Se hace duplicando stdout/stderr (`bot._Tee`), no cambiando cada `print()`, para que no se escape nada. Se vacía al disco en cada escritura: con la salida en buffer, detener el bot a mano perdía el log entero justo cuando más falta hacía. Solo se activa al ejecutar `bot.py`, no al importarlo, para que los scripts de prueba no vayan dejando logs.
 
+### La victoria falsa: por qué el bot nunca pasó del curso 11 (2026-09-20)
+
+El bot llevaba corridas enteras terminando con *"No quedan lecciones
+pendientes en ningún curso"* **sin haber mirado 20 de los 31 cursos**.
+Dejado toda la noche, se paró a las 02:07 diciendo eso mismo.
+
+Lo que lo delató fue el reloj del log: entre salir de la última lección y
+declarar el final pasaron **2 segundos**. Recorrer 31 cursos lleva unos dos
+minutos.
+
+```python
+browser.go_to_courses(page)
+course_count = browser.get_courses(page)
+if course_count == 0:
+    return None, 0, None      # ← quien llama lee esto como "terminado"
+```
+
+`go_to_courses()` hacía clic en "Mis cursos" y esperaba **2 segundos
+fijos**. Si la lista no había pintado todavía, `get_courses()` contaba cero
+tarjetas, y cero cursos se interpretaba como *"no queda nada pendiente"* en
+vez de *"no pude leer la lista"*. Los 2 segundos del log son exactamente
+esa espera.
+
+No era que los cursos sin empezar fueran ilegibles: comprobado en vivo que
+un curso nunca abierto lista sus lecciones igual de bien (`0 de 13
+actividades completadas`), así que se habrían elegido sin problema.
+
+Tres arreglos, todos de la misma idea — **no se puede confundir "no hay
+nada" con "no pude mirar"**:
+
+* `go_to_courses()` espera a que aparezcan las tarjetas (y si el clic no
+  llega, va por URL) en vez de contar segundos.
+* Una lista de cursos vacía se reintenta 3 veces y, si sigue vacía, es un
+  error que reinicia la corrida, no un final feliz.
+* Un curso que no se pueda leer —o que no muestre ninguna lección— se
+  cuenta, y si al final del barrido hubo alguno, la corrida NO se da por
+  terminada.
+
 ### Lo que destapó correr el bot leyendo su log (2026-09-20)
 
 * [x] **Una "Prueba" quedaba `Omitida` aunque el bot contestara bien.** Los
@@ -550,9 +588,15 @@ locator.click()
 
 ### Resultado de la corrida completa (2026-09-19)
 
-Tras arreglar todo lo de abajo, el bot recorrió los 31 cursos de punta a
-punta **sin una sola caída** y terminó solo ("no quedan lecciones
-pendientes"). Estado final de las 79 lecciones que tenían trabajo:
+> **CORRECCIÓN (2026-09-20): esa corrida NO recorrió los 31 cursos.** El
+> "no quedan lecciones pendientes" era falso — ver "La victoria falsa" más
+> abajo. Revisando todos los logs existentes, el bot nunca ha pasado del
+> **curso 11**: los únicos que aparecen son el 2 y del 4 al 11. Las cifras
+> de abajo son reales, pero solo cubren esos cursos.
+
+Tras arreglar todo lo de abajo, el bot terminó **sin una sola caída** y se
+paró solo ("no quedan lecciones pendientes"). Estado final de las 79
+lecciones que tenían trabajo:
 
 | | |
 | --- | --- |

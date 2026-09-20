@@ -1455,12 +1455,28 @@ def find_next_lesson(page, skip_keys=()):
     título) se salta en vez de tumbar toda la búsqueda y forzar un
     reinicio.
     """
-    browser.go_to_courses(page)
-    course_count = browser.get_courses(page)
+    # Una lista de cursos vacía NO significa "ya no queda nada": significa
+    # que no se pudo leer. Confundir las dos cosas hizo que una corrida de
+    # noche entera cantara victoria con 20 cursos sin tocar. Se reintenta,
+    # y si aun así no se lee, se trata como error (quien llama reinicia)
+    # en vez de como final feliz.
+    course_count = 0
+    for attempt in range(3):
+        browser.go_to_courses(page)
+        course_count = browser.get_courses(page)
+        if course_count:
+            break
+        print(f"La lista de cursos salió vacía (intento {attempt + 1}/3); reintento...")
+        page.wait_for_timeout(3000)
+
     if course_count == 0:
-        return None, 0, None
+        raise RuntimeError(
+            "No se pudo leer la lista de cursos tras 3 intentos: sin ella no hay forma de "
+            "saber qué queda pendiente, así que NO se da la corrida por terminada."
+        )
 
     start = _SESSION_COURSE_HINT[0] % course_count
+    unreadable = []
     for offset in range(course_count):
         course_index = (start + offset) % course_count
         try:
@@ -1470,6 +1486,16 @@ def find_next_lesson(page, skip_keys=()):
             lessons = browser.get_lessons(page)
         except PlaywrightTimeoutError as e:
             print(f"(no se pudo leer el curso {course_index + 1}/{course_count}: {e.message.splitlines()[0]}; lo salto)")
+            unreadable.append(course_index + 1)
+            continue
+
+        # Un curso sin lecciones legibles tampoco es un curso sin trabajo:
+        # es un curso que no se pudo mirar. Comprobado en vivo que hasta un
+        # curso NUNCA empezado lista sus lecciones ("0 de 13 actividades
+        # completadas"), así que una lista vacía siempre es un fallo.
+        if not lessons:
+            print(f"(el curso {course_index + 1}/{course_count} '{course_title}' no mostró ninguna lección; lo salto)")
+            unreadable.append(course_index + 1)
             continue
 
         for lesson_index, lesson in enumerate(lessons):
@@ -1483,6 +1509,15 @@ def find_next_lesson(page, skip_keys=()):
                 browser.start_lesson(page, lesson_index)
                 return lesson["title"], lesson["completed"], course_title
 
+    if unreadable:
+        # Decir "terminado" habiendo cursos sin mirar es inventarse un
+        # éxito: quien llama lo trata como error y reinicia.
+        raise RuntimeError(
+            f"No se pudieron leer {len(unreadable)} curso(s) {unreadable} de {course_count}: "
+            "la corrida NO está terminada."
+        )
+
+    print(f"Revisados los {course_count} cursos, lección por lección.")
     return None, 0, None
 
 

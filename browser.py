@@ -195,17 +195,48 @@ def open_fluency_builder(page):
     print("Título:", page.title())
 
 
+FLUENCY_BUILDER_URL = "https://learn.rosettastone.com/"
+
+
 def go_to_courses(page):
     """
     Navega a "Mis cursos" desde cualquier pantalla de Fluency Builder
     (lista de cursos, detalle de un curso, o tras salir de una lección).
+    Devuelve True si la lista de cursos está de verdad en pantalla.
+
+    **Espera a que aparezcan las tarjetas en vez de contar 2 segundos.**
+    Con la espera fija, si la lista tardaba un poco más, get_courses()
+    contaba CERO cursos — y find_next_lesson() interpretaba ese cero como
+    "no queda nada pendiente" y el bot cantaba victoria sin haber mirado
+    ningún curso. Confirmado en vivo: una corrida de noche entera terminó
+    con "no quedan lecciones pendientes en ningún curso" 2 segundos
+    después de salir de una lección, dejando 20 cursos sin tocar.
     """
-    back_link = page.get_by_text("Mis cursos", exact=True)
-    if back_link.count() > 0:
-        back_link.first.click()
-    else:
-        page.get_by_text("Cursos", exact=True).first.click()
-    page.wait_for_timeout(2000)
+    try:
+        back_link = page.get_by_text("Mis cursos", exact=True)
+        if back_link.count() > 0:
+            back_link.first.click(timeout=5000)
+        else:
+            cursos = page.get_by_text("Cursos", exact=True)
+            if cursos.count() > 0:
+                cursos.first.click(timeout=5000)
+    except Exception:
+        pass  # el respaldo de abajo va por URL, que no depende de ningún clic
+
+    try:
+        page.wait_for_selector('[data-qa="LaunchCourseButton"]', timeout=10000)
+        return True
+    except Exception:
+        pass
+
+    # Respaldo: ir por URL. Un clic puede quedar tapado por un modal o
+    # simplemente no llegar; la dirección siempre funciona.
+    try:
+        page.goto(FLUENCY_BUILDER_URL)
+        page.wait_for_selector('[data-qa="LaunchCourseButton"]', timeout=15000)
+        return True
+    except Exception:
+        return False
 
 
 def get_courses(page):
