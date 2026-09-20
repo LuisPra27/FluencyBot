@@ -909,8 +909,12 @@ def work_pending_activities(page, lesson_title):
         try:
             if _work_single_activity(page, activity):
                 fixed += 1
-        except PlaywrightTimeoutError as e:
-            print(f"  '{activity['type']}': error inesperado ({e.message.splitlines()[0]}); sigo con la siguiente.")
+        except Exception as e:
+            # Cualquier error de UNA actividad: registrarlo y seguir. Antes
+            # solo se atrapaban los timeouts, así que otro tipo de error
+            # (ej. "strict mode violation" en un desplegable con estructura
+            # inesperada) subía hasta main() y reiniciaba la corrida entera.
+            print(f"  '{activity['type']}': error inesperado ({str(e).splitlines()[0][:120]}); sigo con la siguiente.")
             _debug_screenshot_omit(page, activity["type"])
 
         # Volver al resumen deja la página en un punto conocido para el

@@ -1313,15 +1313,19 @@ def select_cloze_option(page, blank_index, option):
     blank_index: índice 1-based del espacio (ClozeDropdown_N).
     option: índice 0-based de la opción (MenuItem_N) o su texto exacto.
     """
-    dropdown = page.locator(f'[data-qa="ClozeDropdown_{blank_index}"]')
-    label = dropdown.locator('[data-qa="MenuButtonLabel"]')
+    # `.first` en todo: confirmado en vivo que un ClozeDropdown_1 puede
+    # contener DENTRO los menús de los demás espacios (3 MenuButton en el
+    # mismo contenedor), y sin `.first` Playwright se niega a actuar
+    # ("strict mode violation") y el error tumbaba la corrida entera.
+    dropdown = page.locator(f'[data-qa="ClozeDropdown_{blank_index}"]').first
+    label = dropdown.locator('[data-qa="MenuButtonLabel"]').first
 
     # Se comprueba que la selección quedó puesta y se reintenta: confirmado
     # en vivo que un espacio podía quedarse sin elegir (con tres espacios,
     # uno se quedaba vacío y el botón del pie seguía en "Omitir", así que la
     # respuesta entera no se podía enviar).
     for attempt in range(3):
-        dropdown.locator('[data-qa="MenuButton"]').click(timeout=5000)
+        dropdown.locator('[data-qa="MenuButton"]').first.click(timeout=5000)
         page.wait_for_timeout(200)
         items = dropdown.locator('[data-qa^="MenuItem_"]')
         wanted = items.nth(option).inner_text().strip() if isinstance(option, int) else option
@@ -1329,7 +1333,7 @@ def select_cloze_option(page, blank_index, option):
         # Timeout corto: si esa opción no existe, fallar rápido en vez de 30 s.
         item.first.click(timeout=5000)
         page.wait_for_timeout(200)
-        if label.count() == 0 or label.first.inner_text().strip() == wanted:
+        if label.count() == 0 or label.inner_text().strip() == wanted:
             return True
     return False
 
