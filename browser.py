@@ -789,9 +789,18 @@ def fill_cloze_drag(page, answers):
         for i, word in enumerate(answers[:targets.count()]):
             for _ in range(3):
                 placed, bank = get_cloze_drag_state(page)
-                if placed[i] == word or word not in bank:
+                if placed[i] == word:
                     break
-                source = page.locator('[data-qa="ClozeDragAndDropBottomArea"] [data-qa="DragDropText"]').nth(bank.index(word))
+                if word in bank:
+                    source = page.locator(
+                        '[data-qa="ClozeDragAndDropBottomArea"] [data-qa="DragDropText"]'
+                    ).nth(bank.index(word))
+                elif word in placed:
+                    # La palabra está en otro hueco (de un intento anterior):
+                    # se arrastra desde ahí.
+                    source = targets.nth(placed.index(word)).locator('[data-qa="DragDropText"]').first
+                else:
+                    break
                 _drag_to(page, source, targets.nth(i))
         placed, _ = get_cloze_drag_state(page)
         return all(placed)
@@ -954,12 +963,17 @@ def get_current_exercise(page, capture_audio=True):
     # and Partners (B1)" que el bot no reconocía y dejaba "Omitida" para
     # siempre. Van primero porque sus selectores son exclusivos.
     if page.locator('[data-qa="ClozeDropTarget"]').count() > 0:
-        _, bank = get_cloze_drag_state(page)
+        placed, bank = get_cloze_drag_state(page)
+        # Las palabras que ya están puestas en un hueco (de un intento
+        # anterior) siguen siendo opciones válidas: si solo se ofrece el
+        # banco, a la IA le faltan palabras y su respuesta se rechaza por
+        # inválida (confirmado en vivo: la respuesta correcta incluía una
+        # palabra que ya estaba colocada).
         return {
             "type": "cloze_drag",
             "text": get_cloze_drag_text(page),
             "blank_count": page.locator('[data-qa="ClozeDropTarget"]').count(),
-            "options": bank,
+            "options": bank + [w for w in placed if w],
         }
 
     if page.locator('[data-qa="inputContainer"] textarea').count() > 0:
@@ -1442,20 +1456,45 @@ def reorder_items(page, target_order):
     """
     original_viewport = fit_exercise_in_viewport(page)
     try:
+        moved = False
         max_moves = len(target_order) * len(target_order) + 5
         for _ in range(max_moves):
             current = get_ordering_items(page)
             if current == target_order:
-                return True
+                # Si el orden pedido ya era el que había, Rosetta no ha
+                # registrado NINGUNA interacción y su botón sigue diciendo
+                # "Omitir": la respuesta no se puede enviar (confirmado en
+                # vivo, pasa cuando el segundo intento de la IA coincide con
+                # cómo quedó la lista tras el primero). Se mueve un ítem y se
+                # devuelve a su sitio para que cuente como interacción.
+                if not moved and len(target_order) >= 2:
+                    _nudge_ordering(page, target_order)
+                return get_ordering_items(page) == target_order
             for i, wanted_text in enumerate(target_order):
                 if current[i] != wanted_text:
                     src_index = current.index(wanted_text)
                     items = page.locator('[data-qa="DraggableSentenceItem"]')
                     _drag_ordering_item(page, items.nth(src_index), items.nth(i), moving_down=src_index < i)
+                    moved = True
                     break
         return get_ordering_items(page) == target_order
     finally:
         restore_viewport(page, original_viewport)
+
+
+def _nudge_ordering(page, target_order):
+    """Intercambia los dos primeros ítems y los devuelve a su sitio."""
+    items = page.locator('[data-qa="DraggableSentenceItem"]')
+    _drag_ordering_item(page, items.nth(0), items.nth(1), moving_down=True)
+    current = get_ordering_items(page)
+    if current == target_order:
+        return
+    for i, wanted_text in enumerate(target_order):
+        if current[i] != wanted_text:
+            items = page.locator('[data-qa="DraggableSentenceItem"]')
+            src_index = current.index(wanted_text)
+            _drag_ordering_item(page, items.nth(src_index), items.nth(i), moving_down=src_index < i)
+            break
 
 
 def write_answer(page, answer):

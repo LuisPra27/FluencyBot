@@ -311,6 +311,16 @@ def _solve_matching(exercise, previous_attempts):
         return _solve_matching_audio(exercise, previous_attempts)
 
     if exercise["targets_are_images"]:
+        if len(targets) > 1:
+            # El modelo solo acepta UNA imagen por petición ("At most 1
+            # image(s) may be provided", confirmado en vivo), así que una
+            # correspondencia con varias imágenes no tiene forma de
+            # resolverse preguntándole. Se avisa ya, sin gastar la llamada:
+            # quien llama pasa al intento a ciegas y el bot aprende la
+            # respuesta que Rosetta revela tras dos fallos.
+            raise ValueError(
+                f"correspondencia con {len(targets)} imágenes: el modelo solo admite una por petición"
+            )
         content = [
             {
                 "type": "text",
