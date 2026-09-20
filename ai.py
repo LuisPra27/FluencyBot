@@ -26,6 +26,7 @@ Por eso, tres cosas:
 
 import json
 import random
+import time
 
 from collections import Counter
 
@@ -95,6 +96,21 @@ def _model_is_missing(error):
     return "404" in text and ("model" in text or "not found" in text)
 
 
+def _is_overloaded(error):
+    """
+    True si el servidor dice "ahora mismo no puedo" (cola llena o demasiadas
+    peticiones), que se arregla esperando. Confirmado en vivo con el modelo
+    de audio: 503 "ResourceExhausted: Worker local total request limit
+    reached (16/16)". Sin esperar, ese error gastaba un intento del
+    ejercicio con una respuesta a ciegas.
+    """
+    status = getattr(error, "status_code", None)
+    if status in (429, 503):
+        return True
+    text = str(error).lower()
+    return "resourceexhausted" in text or "rate limit" in text or "too many requests" in text
+
+
 def _answers(model, timeout_s=25):
     """
     True si el modelo contesta de verdad a una pregunta mínima. Hace falta
@@ -157,6 +173,27 @@ def _call_model(model, content, max_tokens):
         max_tokens=max_tokens,
         timeout=AI_TIMEOUT_S,
     )
+
+
+def _call_with_backoff(model, content, max_tokens):
+    """
+    Llama al modelo, esperando y reintentando si el servidor está saturado.
+
+    El servidor lleno se arregla esperando, no adivinando: sin esto, un 503
+    pasajero gastaba uno de los dos intentos del ejercicio con una respuesta
+    a ciegas — y en los de audio, el único intento con sentido. Confirmado
+    en vivo: "ResourceExhausted: Worker local total request limit reached
+    (16/16)" justo en mitad de una prueba.
+    """
+    for wait_s in (5, 15):
+        try:
+            return _call_model(model, content, max_tokens)
+        except Exception as error:
+            if not _is_overloaded(error):
+                raise
+            print(f"  (el servidor de la IA está saturado; espero {wait_s}s y reintento)")
+            time.sleep(wait_s)
+    return _call_model(model, content, max_tokens)
 
 
 def check_models():
@@ -293,7 +330,7 @@ def _ask_json(content, max_tokens=3000, model=MODEL):
     """
     model = _REPLACEMENTS.get(model, model)
     try:
-        response = _call_model(model, content, max_tokens)
+        response = _call_with_backoff(model, content, max_tokens)
     except Exception as error:
         if not _model_is_missing(error):
             raise
@@ -305,7 +342,7 @@ def _ask_json(content, max_tokens=3000, model=MODEL):
             ) from error
         print(f"!!! El modelo '{model}' ya no existe; cambio a '{replacement}' para el resto de la corrida.")
         _REPLACEMENTS[model] = replacement
-        response = _call_model(replacement, content, max_tokens)
+        response = _call_with_backoff(replacement, content, max_tokens)
     message = response.choices[0].message
 
     reasoning = getattr(message, "reasoning_content", None)
@@ -451,11 +488,21 @@ def _solve_multiple_choice_audio(exercise, prompt_audio_url, option_audio_urls, 
     esa parte). Usa AUDIO_MODEL (el único de los dos modelos que entiende
     audio) y le manda cada clip presente, etiquetado en el texto.
     """
-    question_desc = (
-        "The question itself is given as an audio clip below (listen to it first)."
-        if prompt_audio_url
-        else f"Question: {exercise['prompt']}"
-    )
+    # Puede haber texto Y audio a la vez, y entonces el texto por sí solo no
+    # basta: "What is his job?" solo se puede responder escuchando el clip.
+    # Por eso se le dice explícitamente al modelo que la información está en
+    # el audio, en vez de dejar que se quede con el enunciado escrito.
+    if prompt_audio_url and exercise.get("prompt"):
+        question_desc = (
+            f"Question: {exercise['prompt']}\n"
+            "Listen to the audio clip below FIRST: it carries the information you "
+            "need (who or what the question refers to). The written question alone "
+            "is not enough to answer."
+        )
+    elif prompt_audio_url:
+        question_desc = "The question itself is given as an audio clip below (listen to it first)."
+    else:
+        question_desc = f"Question: {exercise['prompt']}"
 
     if option_audio_urls:
         options_desc = (

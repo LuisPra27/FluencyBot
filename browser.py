@@ -248,10 +248,20 @@ def start_course(page, index):
     """
     Debe estar en 'Mis cursos'. Hace clic en Iniciar/Continuar del curso en
     la posición 'index' (0-based), llevando a su página de detalle (lista
-    de lecciones de ese curso).
+    de lecciones de ese curso). Devuelve True si la lista llegó a verse.
+
+    Espera a que aparezcan las lecciones en vez de contar 2 segundos fijos.
+    Confirmado en vivo: con la espera fija, el MISMO curso que un minuto
+    antes listaba sus 11 lecciones devolvía CERO. Un curso sin lecciones a
+    la vista parece un curso sin trabajo, que es justo el error que dejó 20
+    cursos sin tocar.
     """
     page.locator('[data-qa="LaunchCourseButton"]').nth(index).click()
-    page.wait_for_timeout(2000)
+    try:
+        page.wait_for_selector('[data-qa="LessonDisplayer"]', timeout=15000)
+        return True
+    except Exception:
+        return False
 
 
 def get_course_progress(page):
@@ -273,6 +283,14 @@ def get_lessons(page):
     """
     lessons = []
     cards = page.locator('[data-qa="LessonDisplayer"]')
+    if cards.count() == 0:
+        # Una última espera antes de rendirse: la lista puede estar todavía
+        # montándose. Devolver [] aquí es indistinguible de "curso sin
+        # lecciones", y eso hacía que el curso se diera por hecho.
+        try:
+            page.wait_for_selector('[data-qa="LessonDisplayer"]', timeout=10000)
+        except Exception:
+            return []
     for i in range(cards.count()):
         card = cards.nth(i)
         title = card.locator('[data-qa="LessonTitle"]').inner_text()
@@ -1080,14 +1098,21 @@ def get_current_exercise(page, capture_audio=True):
         unsolvable = False
 
         prompt_parts = page.locator('[data-qa="MultipleChoicePromptText"] [data-qa="PromptText"]')
-        if prompt_parts.count() > 0:
-            prompt = " ".join(prompt_parts.nth(i).inner_text() for i in range(prompt_parts.count()))
-            prompt_audio_url = None
-        else:
-            prompt = ""
-            prompt_audio_url = get_prompt_audio_data_uri(page) if capture_audio else None
-            if prompt_audio_url is None:
-                unsolvable = True
+        prompt = " ".join(prompt_parts.nth(i).inner_text() for i in range(prompt_parts.count()))
+
+        # El audio de la pregunta se captura TAMBIÉN cuando hay texto.
+        # Antes solo se cogía si no había texto, y eso condenaba a fallar
+        # las preguntas cuyo enunciado escrito no dice nada por sí solo:
+        # confirmado en vivo, "What is his job?" con las opciones
+        # concierge/housekeeper/valet/bellhop, donde el oficio SOLO se
+        # menciona en el clip (el bot fallaba sus dos intentos y tiraba de
+        # la respuesta revelada). Volcando el DOM se vio que esas pantallas
+        # no tienen ninguna imagen: tienen MultipleChoicePromptText Y
+        # MultipleChoicePromptAudio a la vez.
+        prompt_audio_url = get_prompt_audio_data_uri(page) if capture_audio else None
+        if not prompt and prompt_audio_url is None:
+            # Sin texto Y sin audio no hay pregunta que razonar.
+            unsolvable = True
 
         image = page.locator('[data-qa="step_content"] [data-qa="ContentImage"] img')
         image_url = image.first.get_attribute("src") if image.count() > 0 else None
