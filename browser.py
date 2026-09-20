@@ -1332,24 +1332,21 @@ def drag_matching_pair(page, word, target_index):
     word_locator = page.locator('[data-qa="DragDropText"]').filter(has_text=word).first
     target_locator = page.locator('[data-qa="MatchingDropTarget"]').nth(target_index - 1)
 
-    # Timeout corto: si la palabra ya no está abajo (por ejemplo porque la
-    # IA repitió una que ya se colocó), bounding_box() se quedaba esperando
-    # 30 s por un elemento que no va a aparecer.
-    word_box = word_locator.bounding_box(timeout=5000)
-    target_box = target_locator.bounding_box(timeout=5000)
-    if not word_box or not target_box:
-        return False
-
     # Todo el ejercicio tiene que caber en pantalla o el ratón no puede
     # soltar donde debe (ver fit_exercise_in_viewport).
     original = fit_exercise_in_viewport(page)
     try:
-        word_box = word_locator.bounding_box(timeout=5000)
-        target_box = target_locator.bounding_box(timeout=5000)
-        if not word_box or not target_box:
+        # Timeout corto y sin reventar: la palabra puede no estar (la IA
+        # devolvió una vez las FRASES de destino como si fueran palabras),
+        # y sin esto se esperaban 30 s por un elemento inexistente y el
+        # error tumbaba la actividad entera.
+        if not word_locator.bounding_box(timeout=5000) or not target_locator.bounding_box(timeout=5000):
             return False
         _drag_to(page, word_locator, target_locator)
         return True
+    except Exception as e:
+        print(f"  (no se pudo arrastrar {word!r} al destino {target_index}: {type(e).__name__})")
+        return False
     finally:
         restore_viewport(page, original)
 

@@ -559,7 +559,19 @@ def solve_exercise(exercise_data: dict, previous_attempts: list | None = None) -
         return _solve_cloze_input(exercise_data, previous_attempts)
 
     if exercise_type == "matching":
-        return _solve_matching(exercise_data, previous_attempts)
+        solution = _solve_matching(exercise_data, previous_attempts)
+        # Confirmado en vivo: la IA devolvió las FRASES de destino como
+        # claves en vez de las palabras a arrastrar, y el bot se puso a
+        # buscar una palabra que no existe.
+        options = exercise_data["options"]
+        targets = exercise_data["targets"]
+        pairs = solution.get("pairs") or {}
+        if set(pairs) != set(options) or sorted(pairs.values()) != list(range(1, len(targets) + 1)):
+            raise ValueError(
+                f"emparejamiento inválido: claves {list(pairs)[:2]}... deben ser las palabras {options[:2]}... "
+                f"y los destinos 1..{len(targets)}"
+            )
+        return solution
 
     if exercise_type == "ordering":
         return _solve_ordering(exercise_data, previous_attempts)
