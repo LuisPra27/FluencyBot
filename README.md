@@ -522,6 +522,25 @@ locator.click()
 * [x] **Cada omisión deja su motivo en el log**; antes había ramas que avanzaban sin resolver en silencio.
 * [x] La IA daba 2 respuestas para 1 hueco y permutaciones de 5 para 6 ítems; ahora el prompt le da el número exacto y el bot solo rellena los huecos que existen.
 
+### Resultado de la corrida completa (2026-09-19)
+
+Tras arreglar todo lo de abajo, el bot recorrió los 31 cursos de punta a
+punta **sin una sola caída** y terminó solo ("no quedan lecciones
+pendientes"). Estado final de las 79 lecciones que tenían trabajo:
+
+| | |
+| --- | --- |
+| Completas al 100% | **17** |
+| Resueltas salvo las actividades de voz | **61** |
+| Con algo pendiente que no es de voz | **1** |
+
+Esa última (`Giving Feedback, Part I`) tiene su respuesta ya aprendida y
+está en 0/3 fallos, así que la próxima corrida debería cerrarla.
+
+Lo que queda sin hacer es lo único que se acordó dejar: **hablar**. El bot
+detectó 38 actividades cuya pantalla exige grabar la voz aunque su tipo no
+lo diga (ver `speech_activities.json`).
+
 ### Tipos de ejercicio del curso "Talking with Clients" (mapeados en vivo)
 
 Ninguno se reconocía y todas sus actividades quedaban "Omitida" para siempre.
