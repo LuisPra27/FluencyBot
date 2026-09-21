@@ -6,6 +6,7 @@ import time
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 import browser
+import config
 import ai
 
 # La consola de Windows no siempre usa UTF-8 por defecto: un print() con un
@@ -16,7 +17,7 @@ import ai
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-LOGS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+LOGS_DIR = os.path.join(config.APP_DIR, "logs")
 
 
 class _Tee:
@@ -90,9 +91,9 @@ MAX_LESSON_FAILURES = 3
 # solo una red de seguridad para no colgarse si algo nunca avanza.
 MAX_ACTIVITY_STEPS = 12
 
-BLOCKED_LESSONS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "blocked_lessons.json")
-KNOWN_ANSWERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "known_answers.json")
-SPEECH_ACTIVITIES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "speech_activities.json")
+BLOCKED_LESSONS_FILE = os.path.join(config.APP_DIR, "blocked_lessons.json")
+KNOWN_ANSWERS_FILE = os.path.join(config.APP_DIR, "known_answers.json")
+SPEECH_ACTIVITIES_FILE = os.path.join(config.APP_DIR, "speech_activities.json")
 
 # Motivos por los que no hay que volver a entrar a una lección.
 #   speech    -> lo único pendiente requiere grabar la propia voz.
@@ -318,7 +319,7 @@ def _forget_answer(key):
 
 # --- Instrumentación temporal para verificar en vivo que solo se omiten
 # actividades de habla (ver run_lesson) --- #
-_DEBUG_OMIT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug_omits")
+_DEBUG_OMIT_DIR = os.path.join(config.APP_DIR, "debug_omits")
 _debug_omit_count = 0
 
 
@@ -1684,7 +1685,7 @@ def main():
 
 MAX_RESTARTS = 30
 
-if __name__ == "__main__":
+def _run():
     _start_logging()
 
     # Que el modelo exista se comprueba ANTES de abrir el navegador: si
@@ -1695,7 +1696,7 @@ if __name__ == "__main__":
     print(f"IA: {models_message}")
     if not models_ok:
         print("No se arranca: sin modelo no hay forma de resolver nada.")
-        raise SystemExit(1)
+        return
 
     for attempt in range(1, MAX_RESTARTS + 1):
         print(f"=== Intento {attempt}/{MAX_RESTARTS} ===")
@@ -1705,3 +1706,15 @@ if __name__ == "__main__":
         print("Se interrumpió por un error; reiniciando desde cero (el progreso ya hecho no se pierde)...")
     else:
         print(f"Se alcanzó el máximo de {MAX_RESTARTS} reintentos sin terminar. Revisar manualmente.")
+
+
+if __name__ == "__main__":
+    try:
+        _run()
+    finally:
+        # Con doble clic en el .exe, la ventana se cierra en cuanto acaba el
+        # programa y no da tiempo a leer ni el resultado ni un error. Desde
+        # una terminal no hace falta: la salida se queda en pantalla.
+        if getattr(sys, "frozen", False):
+            print()
+            input("Pulsa Enter para cerrar esta ventana...")

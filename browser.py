@@ -140,8 +140,29 @@ def get_prompt_audio_data_uri(page):
     return _capture_audio_from_buttons(page, [button])[0]
 
 
+def _install_chromium():
+    """
+    Descarga el Chromium de Playwright. Hace falta la primera vez que se usa
+    el .exe: quien lo descarga no tiene ni Python ni el comando
+    `playwright install`, y el navegador no va dentro del exe (pesaría
+    cientos de MB más). Se usa el instalador que Playwright ya trae dentro.
+    """
+    import subprocess
+    from playwright._impl._driver import compute_driver_executable, get_driver_env
+
+    node, cli = compute_driver_executable()
+    print("Primera vez: descargando el navegador que usa el bot (solo esta vez, puede tardar unos minutos)...")
+    subprocess.run([node, cli, "install", "chromium"], env=get_driver_env(), check=True)
+
+
 def open_browser(playwright):
-    browser = playwright.chromium.launch(headless=False)
+    try:
+        browser = playwright.chromium.launch(headless=False)
+    except Exception as error:
+        if "Executable doesn't exist" not in str(error):
+            raise
+        _install_chromium()
+        browser = playwright.chromium.launch(headless=False)
     # permissions=[] deniega micrófono/cámara sin preguntar: evita el popup nativo
     # del navegador y hace que el sitio muestre su propio modal "Continuar sin voz"
     # en los ejercicios de habla (que no podemos automatizar de todos modos).
