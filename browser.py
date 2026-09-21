@@ -152,7 +152,10 @@ def _install_chromium():
 
     node, cli = compute_driver_executable()
     print("Primera vez: descargando el navegador que usa el bot (solo esta vez, puede tardar unos minutos)...")
-    subprocess.run([node, cli, "install", "chromium"], env=get_driver_env(), check=True)
+    # --no-shell: sin él también baja el "Chrome Headless Shell" (~100 MB) que
+    # este bot no usa, porque abre el navegador visible. Visto en la prueba
+    # del .exe.
+    subprocess.run([node, cli, "install", "chromium", "--no-shell"], env=get_driver_env(), check=True)
 
 
 def open_browser(playwright):
