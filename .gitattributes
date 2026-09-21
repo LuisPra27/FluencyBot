@@ -1,2 +1,7 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Los .bat NECESITAN fines de linea de Windows: con los de Linux, cmd falla
+# en los saltos a etiquetas (goto/call :etiqueta). Se fuerza CRLF tambien en
+# el ZIP que descarga GitHub, que si no los entregaria rotos.
+*.bat text eol=crlf

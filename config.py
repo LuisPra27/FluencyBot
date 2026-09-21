@@ -62,8 +62,17 @@ def _first_run_setup(missing):
             continue
         value = ""
         while not value:
-            # La contraseña va tal cual: podría acabar en espacio de verdad.
-            value = getpass.getpass(f"{label}: ") if secret else input(f"{label}: ").strip()
+            try:
+                # La contraseña va tal cual: podría acabar en espacio de verdad.
+                value = getpass.getpass(f"{label}: ") if secret else input(f"{label}: ").strip()
+            except EOFError:
+                # En Windows, una entrada redirigida a NUL (ej. el Programador
+                # de tareas) dice ser una consola pero no hay nadie que
+                # escriba. Se sale sin más y el aviso de abajo ("Falta ...
+                # en el archivo .env") explica qué hacer, en vez de un
+                # EOFError críptico.
+                print()
+                return
         os.environ[name] = value
         with open(ENV_FILE, "a", encoding="utf-8") as fh:
             fh.write(f"{name}={_quote(value)}\n")

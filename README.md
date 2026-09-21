@@ -332,6 +332,10 @@ Nunca se deberán almacenar credenciales directamente dentro del código fuente.
 
 ## Instalación
 
+> **La forma fácil:** doble clic en `instalar.bat` y después en `FluencyBot.bat`.
+> Todos los detalles, en [GUIA_DE_USO.md](GUIA_DE_USO.md). Lo de abajo es la
+> instalación a mano.
+
 Crear entorno virtual:
 
 ```powershell
@@ -823,4 +827,6 @@ CONTINUAR
 
 La **inteligencia artificial será responsable de resolver los ejercicios**, mientras que **Playwright será responsable de ejecutar las respuestas dentro de la interfaz**.
 
-El sistema continuará este proceso automáticamente hasta completar la actividad.
+Ejecutar:                                                               
+>> .\venv\Scripts\python.exe bot.py                                                                                                         
+                                                          

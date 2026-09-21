@@ -30,11 +30,36 @@ queda nada pendiente.
   inglés no funciona sin editar esos textos en `browser.py`.
 * **Una API key de [build.nvidia.com](https://build.nvidia.com)** (gratuita).
   Es la IA que resuelve los ejercicios.
-* **Python 3.10 o superior** y unos 500 MB libres (Chromium ocupa lo suyo).
+* **Unos 500 MB libres** (Chromium ocupa lo suyo). Python 3.10 o superior
+  también, pero si no lo tienes, `instalar.bat` te ofrece instalarlo.
 
 ---
 
 ## 3. Instalación
+
+**Doble clic en `instalar.bat`.** Solo hace falta la primera vez.
+
+Hace esto, en orden, y te dice en cada paso por dónde va:
+
+1. Busca Python 3.10 o superior. Si no lo tienes, te pregunta si quieres
+   instalarlo con `winget` (el instalador de programas de Windows).
+2. Crea una carpeta `venv` con un Python propio para el bot. **No toca nada
+   del resto del equipo**: para desinstalarlo basta con borrar la carpeta
+   del bot.
+3. Instala las librerías, en las versiones exactas con las que se ha
+   probado.
+4. Descarga el navegador que usa el bot.
+
+Si prefieres saber exactamente qué ejecuta antes de abrirlo, ábrelo con el
+Bloc de notas: es un archivo de texto.
+
+> **¿Windows dice que el archivo puede ser peligroso?** Pasa con cualquier
+> `.bat` descargado de internet. Pulsa "Más información" → "Ejecutar de
+> todas formas". Si no te fías, ábrelo antes con el Bloc de notas y mira lo
+> que hace.
+
+<details>
+<summary>Instalación a mano (sin el .bat)</summary>
 
 Desde la carpeta del proyecto, en PowerShell:
 
@@ -43,24 +68,42 @@ python -m venv venv
 ```
 
 ```powershell
-.\venv\Scripts\Activate.ps1
+.\venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
 ```powershell
-pip install -r requirements.txt
+.\venv\Scripts\python.exe -m playwright install chromium --no-shell
 ```
 
-```powershell
-playwright install chromium
-```
+</details>
 
-El último paso descarga el navegador que usa el bot. Sin él no arranca.
+### ¿Por qué no hay un `.exe`?
+
+Se probó. Windows Defender lo borra a los pocos segundos de arrancar y lo
+marca como `Trojan:Win32/Bearfoos.A!ml`. No es un virus: el `!ml` indica
+una detección automática por "parecido", el falso positivo clásico de los
+programas empaquetados con PyInstaller, sobre todo si descargan cosas,
+abren un navegador y manejan contraseñas, que es justo lo que hace este.
+
+Un `.exe` que el antivirus borra no le sirve a nadie. Los `.bat` son
+texto: se pueden leer antes de ejecutarlos y no hay nada que marcar.
 
 ---
 
 ## 4. Credenciales
 
-Crea un archivo llamado `.env` en la carpeta del proyecto:
+**La primera vez que abras `FluencyBot.bat`, el propio bot te las pide:**
+
+```
+Correo de Rosetta Stone: ...
+Contraseña de Rosetta Stone (no se verá al escribir): ...
+API key de build.nvidia.com (empieza por nvapi-): ...
+```
+
+La contraseña no se ve mientras la escribes; es normal. Se guardan en un
+archivo `.env` dentro de la carpeta del bot y no vuelve a preguntarlas.
+
+Si prefieres crearlo a mano, es un archivo de texto llamado `.env`:
 
 ```env
 FLUENCY_EMAIL=tu_correo@ejemplo.com
@@ -68,37 +111,37 @@ FLUENCY_PASSWORD=tu_contraseña
 AI_API_KEY=nvapi-...
 ```
 
-Ese archivo **no se sube nunca a git** (está en `.gitignore`). Si falta
-alguna de las tres variables, el bot se niega a arrancar y te dice cuál
-falta.
+Para cambiar algún dato, edita ese archivo o bórralo y el bot volverá a
+preguntar. **Nunca lo compartas ni lo subas a ningún sitio**: tiene tu
+contraseña en texto plano (en git ya está excluido por `.gitignore`).
 
 ---
 
 ## 5. Ejecutarlo
 
-Con el entorno virtual activado:
+**Doble clic en `FluencyBot.bat`.**
 
-```powershell
-python -u bot.py
-```
+Se abre una ventana de Chromium y verás al bot trabajando. **No cierres esa
+ventana ni uses ese navegador**: es el que está manejando.
 
-Si no lo activaste, llama al Python del entorno directamente:
+Para pararlo: cierra la ventana negra, o `Ctrl+C` dentro de ella. Cuando
+termina solo, la ventana espera a que pulses una tecla para que puedas leer
+cómo acabó.
+
+<details>
+<summary>Desde una terminal</summary>
 
 ```powershell
 .\venv\Scripts\python.exe -u bot.py
 ```
 
-> **El `-u` importa**: sin él la salida se queda en el buffer y, si paras
-> el bot a mano, pierdes el log justo cuando más falta hace.
->
-> **Y tiene que ser el Python del `venv`**, no el del sistema: el del
-> sistema no tiene instaladas las dependencias y falla con
-> `ModuleNotFoundError: No module named 'openai'`.
+* **El `-u` importa**: sin él la salida se queda en el buffer y, si paras el
+  bot a mano, pierdes el log justo cuando más falta hace.
+* **Tiene que ser el Python del `venv`**, no el del sistema: el del sistema
+  no tiene las librerías y falla con
+  `ModuleNotFoundError: No module named 'openai'`.
 
-Se abre una ventana de Chromium y verás al bot trabajando. **No cierres esa
-ventana ni uses ese navegador**: es el que está manejando.
-
-Para pararlo: `Ctrl+C` en la terminal.
+</details>
 
 ---
 
@@ -163,6 +206,8 @@ Ninguno se sube a git: son el estado de *tu* cuenta.
 | `blocked_lessons.json` | Lecciones que no hay que volver a abrir (solo queda voz, ya resueltas, o agotaron sus reintentos) y por qué |
 | `known_answers.json` | Respuestas que Rosetta le enseñó tras fallar. Se borran solas al usarlas con éxito |
 | `speech_activities.json` | Actividades que, al abrirlas, resultaron exigir micrófono aunque su tipo no lo dijera |
+| `.env` | Tus datos de acceso. Lo crea el bot la primera vez. **Tiene tu contraseña: no lo compartas** |
+| `venv/` | El Python propio del bot, creado por `instalar.bat`. Si algo se estropea, bórrala y vuelve a instalar |
 | `logs/` | Un log por corrida |
 | `debug_omits/` | Capturas de pantallas que no supo resolver. Solo para investigar; se pueden borrar |
 
@@ -175,12 +220,24 @@ archivo entero.
 
 ## 9. Problemas comunes
 
+**"Todavía no está instalado: primero haz doble clic en instalar.bat"**
+Falta la carpeta `venv`. Ejecuta `instalar.bat`.
+
 **`ModuleNotFoundError: No module named 'openai'`**
-Estás usando el Python del sistema. Activa el entorno o llama a
-`.\venv\Scripts\python.exe`.
+Se está usando el Python del sistema en vez del del bot. Arranca siempre con
+`FluencyBot.bat`; si ya lo hacías, vuelve a ejecutar `instalar.bat`.
+
+**El instalador dice que no encuentra Python**
+Deja que lo instale con `winget` (te lo pregunta), o descárgalo de
+[python.org](https://www.python.org/downloads/) marcando **"Add python.exe
+to PATH"**. Ojo: en muchos equipos, escribir `python` abre la Microsoft
+Store en vez de ejecutar nada; el instalador lo detecta y no se deja
+engañar.
 
 **`Falta FLUENCY_EMAIL en el archivo .env`**
-No existe el `.env`, o está en otra carpeta, o le falta esa línea.
+El bot no pudo preguntarte los datos (pasa si se lanza sin ventana, por
+ejemplo desde el Programador de tareas). Ábrelo con doble clic en
+`FluencyBot.bat`, o crea el `.env` a mano (sección 4).
 
 **Se abre el navegador pero no inicia sesión**
 Revisa correo y contraseña entrando a mano en
@@ -285,8 +342,13 @@ El repositorio ya ignora todo lo personal (`.env`, los `.json` de estado,
 reciba solo tiene que hacer los pasos 2 a 5 de esta guía con **sus propias**
 credenciales.
 
-Dos cosas que conviene avisarle:
+Solo necesita descargarlo, hacer doble clic en `instalar.bat` y después en
+`FluencyBot.bat`.
 
-* Depende de que la interfaz de Rosetta esté **en español**.
-* `requirements.txt` no fija versiones, así que una versión futura de
-  Playwright podría romper algo.
+Conviene avisarle de que depende de que la interfaz de Rosetta esté **en
+español**.
+
+Las versiones de las librerías están fijadas en `requirements.txt` (las
+mismas con las que se ha probado), así que una actualización de Playwright o
+de OpenAI no le romperá la instalación. Para probar versiones nuevas hay que
+cambiarlas ahí a propósito.
