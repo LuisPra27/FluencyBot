@@ -62,7 +62,8 @@ def _first_run_setup(missing):
             continue
         value = ""
         while not value:
-            value = (getpass.getpass(f"{label}: ") if secret else input(f"{label}: ")).strip()
+            # La contraseña va tal cual: podría acabar en espacio de verdad.
+            value = getpass.getpass(f"{label}: ") if secret else input(f"{label}: ").strip()
         os.environ[name] = value
         with open(ENV_FILE, "a", encoding="utf-8") as fh:
             fh.write(f"{name}={_quote(value)}\n")
