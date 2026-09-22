@@ -1,6 +1,6 @@
 # Guía de uso
 
-Pasos para poner a funcionar el bot desde cero. El `README.md` explica
+Pasos para poner a funcionar el bot desde cero. El `Progreso.md` explica
 **cómo está hecho** y **por qué**; esta guía explica **cómo usarlo**.
 
 ---
