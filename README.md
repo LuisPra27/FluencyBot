@@ -534,10 +534,10 @@ correspondientes propietarios.
 
 ## Licencia
 
-Este repositorio no incluye todavía un archivo `LICENSE`. Sin él, y por
-defecto, el código queda bajo derechos de autor reservados: se puede ver y
-clonar desde GitHub, pero no se conceden permisos de uso, modificación ni
-redistribución.
+El código de FluencyBot se distribuye bajo la licencia MIT. Consulta el
+archivo `LICENSE` incluido en este repositorio para conocer las condiciones
+completas: en resumen, puedes usarlo, modificarlo y redistribuirlo mientras
+conserves el aviso de copyright, y se entrega sin garantía de ningún tipo.
 
 La licencia del código fuente no otorga derechos sobre contenidos, marcas,
 servicios o propiedad intelectual pertenecientes a terceros.
