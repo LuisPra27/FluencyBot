@@ -1,11 +1,85 @@
-# Guía de uso
+# FluencyBot
+
+FluencyBot es un bot de automatización desarrollado en Python que utiliza
+Playwright e inteligencia artificial para resolver automáticamente ejercicios
+de aprendizaje de idiomas en Rosetta Stone.
+
+El bot navega por la plataforma, identifica los diferentes tipos de
+actividades, utiliza modelos de IA para generar respuestas, las envía y
+registra respuestas conocidas para utilizarlas posteriormente. Las actividades
+que requieren respuesta hablada se omiten deliberadamente.
+
+**FluencyBot no es una herramienta oficial de Rosetta Stone y no está
+desarrollado, respaldado, autorizado ni afiliado a Rosetta Stone.**
+
+---
+
+## ⚠️ Advertencia importante
+
+El uso de este software **puede infringir los términos de servicio, acuerdos de
+licencia o reglas de uso de Rosetta Stone**. También puede estar prohibido por
+las normas académicas de la institución o curso en el que se utilice.
+
+El uso del bot puede provocar, entre otras cosas:
+
+* Bloqueo o suspensión de la cuenta.
+* Pérdida de acceso a Rosetta Stone.
+* Pérdida del progreso realizado en la plataforma.
+* Restricciones sobre la cuenta o el acceso al servicio.
+* Consecuencias académicas si su utilización está prohibida por una
+  institución educativa.
+* Otras consecuencias derivadas de los términos, contratos o normas
+  aplicables.
+
+El autor no se responsabiliza por bloqueos, suspensiones, pérdida de acceso,
+pérdida de progreso, sanciones académicas, restricciones de cuenta ni cualquier
+otra consecuencia derivada del uso de este software.
+
+La inclusión de esta advertencia no constituye asesoramiento jurídico ni
+determina por sí misma si el uso del software es legal o ilegal. Las
+consecuencias jurídicas dependen de la legislación, los contratos, las
+licencias y las circunstancias aplicables en cada caso.
+
+**Si decides utilizar FluencyBot, eres responsable de verificar previamente si
+su uso está permitido y de asumir las consecuencias derivadas de dicho uso.**
+
+---
+
+## ¿Qué hace?
+
+FluencyBot puede:
+
+* Iniciar sesión en la plataforma.
+* Detectar y clasificar diferentes tipos de actividades.
+* Resolver preguntas mediante modelos de inteligencia artificial.
+* Resolver actividades de selección múltiple.
+* Resolver ejercicios de completar espacios.
+* Resolver traducciones.
+* Resolver ejercicios de ordenamiento.
+* Resolver actividades de emparejamiento.
+* Resolver actividades basadas en imágenes.
+* Resolver preguntas escritas.
+* Resolver actividades de comprensión auditiva.
+* Registrar respuestas conocidas para reutilizarlas posteriormente.
+* Reintentar actividades que no fueron resueltas correctamente.
+* Omitir actividades que requieren respuesta hablada.
+
+El comportamiento exacto puede variar dependiendo de la estructura actual de la
+plataforma y de los modelos de IA utilizados.
+
+**Tecnologías:** Python, Playwright, modelos de inteligencia artificial, y JSON
+para el almacenamiento local de configuración y respuestas conocidas.
+
+---
+
+## Guía de uso
 
 Pasos para poner a funcionar el bot desde cero. El `Progreso.md` explica
 **cómo está hecho** y **por qué**; esta guía explica **cómo usarlo**.
 
 ---
 
-## 1. Qué hace y qué NO hace
+### 1. Qué hace y qué NO hace
 
 El bot entra a Rosetta Stone Fluency Builder, recorre tus cursos, busca las
 lecciones con actividades pendientes y las resuelve con ayuda de una IA.
@@ -22,7 +96,7 @@ queda nada pendiente.
 
 ---
 
-## 2. Lo que necesitas antes de empezar
+### 2. Lo que necesitas antes de empezar
 
 * **Una cuenta de Rosetta Stone Fluency Builder** (correo y contraseña).
 * **La interfaz de Rosetta en español.** El bot busca textos literales
@@ -35,7 +109,7 @@ queda nada pendiente.
 
 ---
 
-## 3. Instalación
+### 3. Instalación
 
 **Doble clic en `instalar.bat`.** Solo hace falta la primera vez.
 
@@ -77,7 +151,7 @@ python -m venv venv
 
 </details>
 
-### ¿Por qué no hay un `.exe`?
+#### ¿Por qué no hay un `.exe`?
 
 Se probó. Windows Defender lo borra a los pocos segundos de arrancar y lo
 marca como `Trojan:Win32/Bearfoos.A!ml`. No es un virus: el `!ml` indica
@@ -90,7 +164,7 @@ texto: se pueden leer antes de ejecutarlos y no hay nada que marcar.
 
 ---
 
-## 4. Credenciales
+### 4. Credenciales
 
 **La primera vez que abras `FluencyBot.bat`, el propio bot te las pide:**
 
@@ -117,7 +191,7 @@ contraseña en texto plano (en git ya está excluido por `.gitignore`).
 
 ---
 
-## 5. Ejecutarlo
+### 5. Ejecutarlo
 
 **Doble clic en `FluencyBot.bat`.**
 
@@ -145,7 +219,7 @@ cómo acabó.
 
 ---
 
-## 6. Cómo saber qué está pasando
+### 6. Cómo saber qué está pasando
 
 Cada corrida escribe un log completo en `logs/bot_<fecha>_<hora>.log`, con
 la hora al principio de cada línea. Es lo mismo que sale por pantalla, así
@@ -171,7 +245,7 @@ Get-Content -Wait -Tail 20 (Get-ChildItem logs\*.log | Sort-Object LastWriteTime
 
 ---
 
-## 7. Dejarlo corriendo toda la noche
+### 7. Dejarlo corriendo toda la noche
 
 Funciona sin problema, con una condición: **que el equipo no se suspenda**.
 La pantalla puede apagarse y la sesión puede quedar bloqueada, pero si
@@ -197,7 +271,7 @@ ya intentadas** en esa misma sesión, así que reintentar es barato.
 
 ---
 
-## 8. Los archivos que va creando
+### 8. Los archivos que va creando
 
 Ninguno se sube a git: son el estado de *tu* cuenta.
 
@@ -218,7 +292,7 @@ archivo entero.
 
 ---
 
-## 9. Problemas comunes
+### 9. Problemas comunes
 
 **"Todavía no está instalado: primero haz doble clic en instalar.bat"**
 Falta la carpeta `venv`. Ejecuta `instalar.bat`.
@@ -259,7 +333,7 @@ revisarlo: en el log aparecen los errores de la API tal cual.
 
 ---
 
-## 9b. Si el modelo de IA deja de funcionar
+### 9b. Si el modelo de IA deja de funcionar
 
 Es el problema más probable a medio plazo: **NVIDIA da de baja modelos sin
 avisar**. Ya pasó una vez con `muse-glimmer-30b`, que empezó a devolver 404
@@ -335,7 +409,7 @@ Hay tres redes de seguridad, en este orden:
 
 ---
 
-## 10. Si quieres compartirlo
+### 10. Si quieres compartirlo
 
 El repositorio ya ignora todo lo personal (`.env`, los `.json` de estado,
 `logs/`, capturas y `venv/`), así que se puede publicar tal cual. Quien lo
@@ -352,3 +426,124 @@ Las versiones de las librerías están fijadas en `requirements.txt` (las
 mismas con las que se ha probado), así que una actualización de Playwright o
 de OpenAI no le romperá la instalación. Para probar versiones nuevas hay que
 cambiarlas ahí a propósito.
+
+---
+
+## Seguridad
+
+FluencyBot automatiza un navegador y puede interactuar con una cuenta en tu
+nombre.
+
+Por esta razón, no ejecutes código que no hayas revisado o comprendido y no
+ignores automáticamente las advertencias de seguridad de Windows Defender u
+otros sistemas de seguridad. Si un antivirus detecta algún archivo del
+proyecto, analiza la detección antes de decidir si continuar: una detección
+heurística puede ser un falso positivo, pero también puede indicar un
+comportamiento que merece revisión.
+
+Utiliza únicamente tus propias credenciales y revisa el código antes de
+proporcionar cualquier información de acceso.
+
+**No compartas nunca:**
+
+* Tu contraseña.
+* Tu archivo `.env`.
+* Claves de API.
+* Tokens de acceso.
+* Cookies de sesión.
+* Capturas de pantalla que contengan información sensible.
+* Archivos de registro que puedan contener información privada.
+
+---
+
+## Contenido de Rosetta Stone
+
+Este repositorio no tiene como objetivo redistribuir el contenido propietario
+de Rosetta Stone.
+
+El repositorio **no incluye deliberadamente**:
+
+* Audios propietarios.
+* Imágenes propietarias.
+* Bases de datos de Rosetta Stone.
+* Copias de las actividades.
+* Materiales de los cursos.
+* Credenciales de usuarios.
+* Datos privados de otros usuarios.
+
+El bot obtiene la información necesaria durante su ejecución directamente desde
+la plataforma y utiliza modelos de IA para procesar las actividades.
+
+---
+
+## Uso académico
+
+FluencyBot puede utilizarse para automatizar actividades que forman parte de
+cursos o programas educativos.
+
+Antes de utilizarlo con una actividad académica, verifica las reglas de tu
+institución, profesor o programa. **El hecho de que técnicamente sea posible
+automatizar una actividad no significa que su uso esté permitido
+académicamente.**
+
+---
+
+## Estado del proyecto
+
+Este proyecto es experimental y **puede dejar de funcionar** si Rosetta Stone
+modifica su interfaz, estructura, mecanismos de autenticación, actividades o
+cualquier otro componente utilizado por el bot.
+
+No se garantiza que FluencyBot funcione permanentemente.
+
+---
+
+## Descargo de responsabilidad
+
+El software se proporciona **tal como está**, sin garantía de funcionamiento
+continuo, exactitud de las respuestas o compatibilidad futura.
+
+El autor no se responsabiliza por:
+
+* Bloqueos o suspensiones de cuentas.
+* Pérdida de acceso.
+* Pérdida de progreso.
+* Errores producidos por el bot.
+* Respuestas incorrectas generadas por la IA.
+* Cambios realizados por Rosetta Stone que provoquen que el bot deje de
+  funcionar.
+* Sanciones académicas.
+* Consecuencias derivadas del incumplimiento de términos de servicio,
+  licencias, contratos o normas institucionales.
+* Cualquier otra consecuencia derivada del uso del software.
+
+El usuario decide bajo su propia responsabilidad si desea ejecutar este
+proyecto.
+
+---
+
+## Afiliación
+
+FluencyBot no está afiliado, asociado, patrocinado, respaldado ni autorizado
+por Rosetta Stone.
+
+Rosetta Stone y sus respectivas marcas y contenidos pertenecen a sus
+correspondientes propietarios.
+
+---
+
+## Licencia
+
+Este repositorio no incluye todavía un archivo `LICENSE`. Sin él, y por
+defecto, el código queda bajo derechos de autor reservados: se puede ver y
+clonar desde GitHub, pero no se conceden permisos de uso, modificación ni
+redistribución.
+
+La licencia del código fuente no otorga derechos sobre contenidos, marcas,
+servicios o propiedad intelectual pertenecientes a terceros.
+
+---
+
+## Autor
+
+Luis Prado — proyecto desarrollado de forma independiente.
